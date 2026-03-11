@@ -8,6 +8,7 @@ import jakarta.inject.Inject;
 import jakarta.inject.Named;
 import org.moxie.confer.proxy.config.Config;
 import org.moxie.confer.proxy.controllers.OpenAIWebsocketHandler;
+import org.moxie.confer.proxy.crypto.ImageToken;
 import org.moxie.confer.proxy.qualifiers.VllmAI;
 import org.moxie.confer.proxy.tools.ToolRegistry;
 
@@ -27,11 +28,14 @@ public class OpenAIWebsocketHandlerProducer {
   @Inject
   Config config;
 
+  @Inject
+  ImageToken imageToken;
+
   @Produces
   @Named("vllm")
   @ApplicationScoped
   public OpenAIWebsocketHandler produceVllmAiHandler() {
-    return new OpenAIWebsocketHandler(vllmAIClient, mapper, toolRegistry, config);
+    return new OpenAIWebsocketHandler(vllmAIClient, mapper, toolRegistry, config, imageToken);
   }
 
 }

@@ -3,6 +3,7 @@ package org.moxie.confer.proxy.controllers;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.openai.client.OpenAIClient;
+import com.openai.core.JsonValue;
 import com.openai.core.http.StreamResponse;
 import com.openai.models.ChatModel;
 import com.openai.models.FunctionDefinition;
@@ -18,16 +19,20 @@ import com.openai.models.chat.completions.ChatCompletionMessageParam;
 import com.openai.models.chat.completions.ChatCompletionMessageToolCall;
 import com.openai.models.completions.CompletionUsage;
 import com.openai.models.chat.completions.ChatCompletionToolMessageParam;
+import com.openai.models.chat.completions.ChatCompletionContentPart;
+import com.openai.models.chat.completions.ChatCompletionContentPartImage;
+import com.openai.models.chat.completions.ChatCompletionContentPartText;
 import com.openai.models.chat.completions.ChatCompletionUserMessageParam;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.WebApplicationException;
 import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.core.StreamingOutput;
+import org.moxie.confer.proxy.config.Config;
+import org.moxie.confer.proxy.crypto.ImageToken;
 import org.moxie.confer.proxy.entities.ChatRequest;
 import org.moxie.confer.proxy.entities.WebsocketRequest;
 import org.moxie.confer.proxy.entities.ToolCallContent;
 import org.moxie.confer.proxy.entities.ToolResponseContent;
-import org.moxie.confer.proxy.config.Config;
 import org.moxie.confer.proxy.streaming.StreamRegistry;
 import org.moxie.confer.proxy.tools.Tool;
 import org.moxie.confer.proxy.tools.ToolRegistry;
@@ -49,18 +54,20 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
   private final ObjectMapper mapper;
   private final ToolRegistry toolRegistry;
   private final Config       config;
+  private final ImageToken   imageToken;
 
-  public OpenAIWebsocketHandler(OpenAIClient client, ObjectMapper mapper, ToolRegistry toolRegistry, Config config) {
+  public OpenAIWebsocketHandler(OpenAIClient client, ObjectMapper mapper, ToolRegistry toolRegistry, Config config, ImageToken imageToken) {
     this.client       = client;
     this.mapper       = mapper;
     this.toolRegistry = toolRegistry;
     this.config       = config;
+    this.imageToken   = imageToken;
   }
 
   @Override
   public WebsocketHandlerResponse handle(WebsocketRequest request, StreamRegistry streamRegistry) {
     ChatRequest chatRequest = parseChatRequest(request);
-    ChatModel   model       = parseModel(chatRequest);
+    ChatModel   model       = ChatModel.of(config.getVllmServedModelName());
 
     if (chatRequest.stream()) {
       return new WebsocketHandlerResponse.StreamingResponse(handleStreamingResponse(model, chatRequest));
@@ -78,14 +85,6 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
       return mapper.readValue(request.body().get(), ChatRequest.class);
     } catch (JsonProcessingException e) {
       throw new WebApplicationException("Invalid ChatRequest body", 400);
-    }
-  }
-
-  private ChatModel parseModel(ChatRequest chatRequest) {
-    try {
-      return ChatModel.of(chatRequest.model());
-    } catch (IllegalArgumentException e) {
-      throw new WebApplicationException("Invalid model: " + chatRequest.model(), 400);
     }
   }
 
@@ -184,6 +183,34 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
       builder.temperature(chatRequest.temperature());
     }
 
+    if (chatRequest.topP() != null) {
+      builder.topP(chatRequest.topP());
+    }
+
+    if (chatRequest.topK() != null) {
+      builder.putAdditionalBodyProperty("top_k", JsonValue.from(chatRequest.topK()));
+    }
+
+    if (chatRequest.minP() != null) {
+      builder.putAdditionalBodyProperty("min_p", JsonValue.from(chatRequest.minP()));
+    }
+
+    if (chatRequest.presencePenalty() != null) {
+      builder.presencePenalty(chatRequest.presencePenalty());
+    }
+
+    if (chatRequest.frequencyPenalty() != null) {
+      builder.frequencyPenalty(chatRequest.frequencyPenalty());
+    }
+
+    if (chatRequest.repetitionPenalty() != null) {
+      builder.putAdditionalBodyProperty("repetition_penalty", JsonValue.from(chatRequest.repetitionPenalty()));
+    }
+
+    if (chatRequest.thinking() != null && !chatRequest.thinking()) {
+      builder.putAdditionalBodyProperty("chat_template_kwargs", JsonValue.from(Map.of("enable_thinking", false)));
+    }
+
     if (chatRequest.maxTokens() != null) {
       builder.maxTokens(chatRequest.maxTokens());
     }
@@ -195,7 +222,13 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
     for (ChatRequest.Message message : chatRequest.messages()) {
       switch (message.role()) {
         case assistant -> builder.addAssistantMessage(message.content());
-        case user      -> builder.addUserMessage(message.content());
+        case user      -> {
+          if (message.imageRefs() != null && !message.imageRefs().isEmpty()) {
+            builder.addMessage(ChatCompletionMessageParam.ofUser(buildMultimodalUserMessage(message)));
+          } else {
+            builder.addUserMessage(message.content());
+          }
+        }
         case system    -> builder.addSystemMessage(message.content());
         case developer -> builder.addDeveloperMessage(message.content());
         case tool_call -> {
@@ -247,6 +280,38 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
     }
 
     return builder.build();
+  }
+
+  private ChatCompletionUserMessageParam buildMultimodalUserMessage(ChatRequest.Message message) {
+    List<ChatCompletionContentPart> parts = new ArrayList<>();
+
+    if (message.content() != null && !message.content().isEmpty()) {
+      parts.add(ChatCompletionContentPart.ofText(
+        ChatCompletionContentPartText.builder().text(message.content()).build()
+      ));
+    }
+
+    for (ChatRequest.ImageRef ref : message.imageRefs()) {
+      String imageUrl = "http://localhost:" + config.getServerPort()
+        + "/v1/images?key=" + urlEncode(ref.s3Key())
+        + "&ek=" + urlEncode(ref.encryptionKey())
+        + "&token=" + urlEncode(imageToken.get())
+        + "&type=" + urlEncode(ref.mediaType() != null ? ref.mediaType() : "image/jpeg");
+
+      parts.add(ChatCompletionContentPart.ofImageUrl(
+        ChatCompletionContentPartImage.builder()
+          .imageUrl(ChatCompletionContentPartImage.ImageUrl.builder().url(imageUrl).build())
+          .build()
+      ));
+    }
+
+    return ChatCompletionUserMessageParam.builder()
+      .content(ChatCompletionUserMessageParam.Content.ofArrayOfContentParts(parts))
+      .build();
+  }
+
+  private static String urlEncode(String value) {
+    return java.net.URLEncoder.encode(value, java.nio.charset.StandardCharsets.UTF_8);
   }
 
   private void addToolsToBuilder(ChatCompletionCreateParams.Builder builder, Boolean webSearch, List<ChatRequest.ClientTool> clientTools) {
@@ -434,6 +499,11 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
           return;
         }
 
+        JsonValue reasoningValue = delta._additionalProperties().get("reasoning");
+        if (reasoningValue != null && reasoningValue.asString().isPresent()) {
+          streamReasoningToOutput(reasoningValue.asStringOrThrow(), output);
+        }
+
         if (delta.content().isPresent()) {
           String content = delta.content().get();
           streamContentToOutput(content, output);
@@ -464,6 +534,14 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
             acc.arguments.append(func.arguments().get());
           }
         }
+      }
+    }
+
+    private void streamReasoningToOutput(String reasoning, OutputStream output) throws IOException {
+      if (!reasoning.isEmpty()) {
+        String thinkingMessage = mapper.writeValueAsString(Map.of("type", "thinking", "content", reasoning));
+        output.write(thinkingMessage.getBytes());
+        output.flush();
       }
     }
 

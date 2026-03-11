@@ -7,6 +7,12 @@ public record ChatRequest(
   List<Message> messages,
   String model,
   Double temperature,
+  Double topP,
+  Integer topK,
+  Double minP,
+  Double presencePenalty,
+  Double frequencyPenalty,
+  Double repetitionPenalty,
   Integer maxTokens,
   Boolean stream,
   Boolean json,
@@ -20,7 +26,14 @@ public record ChatRequest(
 
   public record Message(
     Role role,
-    String content
+    String content,
+    List<ImageRef> imageRefs
+  ) {}
+
+  public record ImageRef(
+    String s3Key,
+    String encryptionKey,
+    String mediaType
   ) {}
 
   public record ClientTool(

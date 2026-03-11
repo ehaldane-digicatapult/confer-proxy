@@ -17,6 +17,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.moxie.confer.proxy.crypto.ImageToken;
 import org.moxie.confer.proxy.entities.ChatRequest;
 import org.moxie.confer.proxy.entities.WebsocketRequest;
 import org.moxie.confer.proxy.config.Config;
@@ -77,7 +78,8 @@ class OpenAIWebsocketHandlerTest {
     streamRegistry = new StreamRegistry();
     lenient().when(config.getMaxToolIterations()).thenReturn(10);
     lenient().when(config.getMaxContextTokens()).thenReturn(262144);
-    handler = new OpenAIWebsocketHandler(openAIClient, mapper, toolRegistry, config);
+    lenient().when(config.getVllmServedModelName()).thenReturn("test-model");
+    handler = new OpenAIWebsocketHandler(openAIClient, mapper, toolRegistry, config, new ImageToken());
   }
 
   @Test
@@ -99,7 +101,13 @@ class OpenAIWebsocketHandlerTest {
   @Test
   void handle_nullModel_throwsBadRequest() throws JsonProcessingException {
     ChatRequest chatRequest = new ChatRequest(
-        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello")),
+        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello", null)),
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
         null,
         null,
         null,
@@ -117,8 +125,14 @@ class OpenAIWebsocketHandlerTest {
   @Test
   void handle_nonStreamingRequest_returnsSingleResponse() throws Exception {
     ChatRequest chatRequest = new ChatRequest(
-        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello")),
+        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello", null)),
         "gpt-4",
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
         null,
         null,
         false,
@@ -150,10 +164,75 @@ class OpenAIWebsocketHandlerTest {
   }
 
   @Test
+  void handle_messageWithImageRefs_sendsMultimodalContent() throws Exception {
+    List<ChatRequest.ImageRef> imageRefs = List.of(
+      new ChatRequest.ImageRef("attachments/photo.enc", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "image/jpeg")
+    );
+    ChatRequest chatRequest = new ChatRequest(
+        List.of(new ChatRequest.Message(ChatRequest.Role.user, "What is in this image?", imageRefs)),
+        "gpt-4",
+        null, null, null, null, null, null, null, null,
+        false,
+        null, null, null, null
+    );
+    WebsocketRequest request = new WebsocketRequest(1L, "POST", "/v1/chat/completions", Optional.of(mapper.writeValueAsString(chatRequest)));
+
+    ChatCompletion mockCompletion = mock(ChatCompletion.class);
+    ChatCompletion.Choice mockChoice = mock(ChatCompletion.Choice.class);
+    ChatCompletionMessage mockMessage = mock(ChatCompletionMessage.class);
+
+    when(openAIClient.chat()).thenReturn(chatService);
+    when(chatService.completions()).thenReturn(completionService);
+    when(completionService.create(any(ChatCompletionCreateParams.class))).thenReturn(mockCompletion);
+    when(mockCompletion.choices()).thenReturn(List.of(mockChoice));
+    when(mockChoice.message()).thenReturn(mockMessage);
+    when(mockMessage.content()).thenReturn(Optional.of("It's a cat"));
+    when(toolRegistry.getAllTools()).thenReturn(java.util.Map.of());
+    when(config.getServerPort()).thenReturn(8080);
+
+    org.mockito.ArgumentCaptor<ChatCompletionCreateParams> captor = org.mockito.ArgumentCaptor.forClass(ChatCompletionCreateParams.class);
+
+    handler.handle(request, streamRegistry);
+
+    verify(completionService).create(captor.capture());
+    ChatCompletionCreateParams params = captor.getValue();
+
+    // The user message should be multimodal (array of content parts)
+    var messages = params.messages();
+    assertEquals(1, messages.size());
+
+    // Inspect the user message content: should be array of content parts, not plain text
+    var userMessage = messages.getFirst().asUser();
+    var content = userMessage.content();
+    assertTrue(content.isArrayOfContentParts(), "Should be multipart content");
+
+    var parts = content.asArrayOfContentParts();
+    assertEquals(2, parts.size(), "Should have text + image parts");
+    assertTrue(parts.get(0).isText(), "First part should be text");
+    assertTrue(parts.get(1).isImageUrl(), "Second part should be image_url");
+
+    String textContent = parts.get(0).asText().text();
+    assertEquals("What is in this image?", textContent);
+
+    String url = parts.get(1).asImageUrl().imageUrl().url();
+    assertTrue(url.startsWith("http://localhost:8080/v1/images?"), "URL should point to localhost image endpoint");
+    assertTrue(url.contains("attachments%2Fphoto.enc"), "URL should contain encoded S3 key");
+    assertTrue(url.contains("ek="), "URL should contain encryption key param");
+    assertTrue(url.contains("token="), "URL should contain token param");
+    assertTrue(url.contains("type=image%2Fjpeg"), "URL should contain media type param");
+  }
+
+  @Test
   void handle_streamingRequest_returnsStreamingResponse() throws Exception {
     ChatRequest chatRequest = new ChatRequest(
-        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello")),
+        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello", null)),
         "gpt-4",
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
         null,
         null,
         true,
@@ -173,8 +252,14 @@ class OpenAIWebsocketHandlerTest {
   @SuppressWarnings("unchecked")
   void handle_streamingRequest_streamsTokensToOutput() throws Exception {
     ChatRequest chatRequest = new ChatRequest(
-        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello")),
+        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello", null)),
         "gpt-4",
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
         null,
         null,
         true,
@@ -229,9 +314,15 @@ class OpenAIWebsocketHandlerTest {
   @Test
   void handle_withTemperature_passesTemperatureToClient() throws Exception {
     ChatRequest chatRequest = new ChatRequest(
-        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello")),
+        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello", null)),
         "gpt-4",
         0.7,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
         null,
         false,
         null,
@@ -263,8 +354,14 @@ class OpenAIWebsocketHandlerTest {
   @Test
   void handle_withMaxTokens_passesMaxTokensToClient() throws Exception {
     ChatRequest chatRequest = new ChatRequest(
-        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello")),
+        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello", null)),
         "gpt-4",
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
         null,
         100,
         false,
@@ -297,8 +394,14 @@ class OpenAIWebsocketHandlerTest {
   @Test
   void handle_withJsonMode_passesResponseFormatToClient() throws Exception {
     ChatRequest chatRequest = new ChatRequest(
-        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello")),
+        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello", null)),
         "gpt-4",
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
         null,
         null,
         false,
@@ -332,12 +435,18 @@ class OpenAIWebsocketHandlerTest {
   void handle_multipleMessageRoles_buildsCorrectParams() throws Exception {
     ChatRequest chatRequest = new ChatRequest(
         List.of(
-            new ChatRequest.Message(ChatRequest.Role.system, "You are helpful"),
-            new ChatRequest.Message(ChatRequest.Role.user, "Hello"),
-            new ChatRequest.Message(ChatRequest.Role.assistant, "Hi there"),
-            new ChatRequest.Message(ChatRequest.Role.user, "How are you?")
+            new ChatRequest.Message(ChatRequest.Role.system, "You are helpful", null),
+            new ChatRequest.Message(ChatRequest.Role.user, "Hello", null),
+            new ChatRequest.Message(ChatRequest.Role.assistant, "Hi there", null),
+            new ChatRequest.Message(ChatRequest.Role.user, "How are you?", null)
         ),
         "gpt-4",
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
         null,
         null,
         false,
@@ -370,8 +479,14 @@ class OpenAIWebsocketHandlerTest {
   @Test
   void handle_emptyChoices_returnsEmptyContent() throws Exception {
     ChatRequest chatRequest = new ChatRequest(
-        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello")),
+        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello", null)),
         "gpt-4",
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
         null,
         null,
         false,
@@ -404,10 +519,16 @@ class OpenAIWebsocketHandlerTest {
   void handle_developerRole_buildsCorrectParams() throws Exception {
     ChatRequest chatRequest = new ChatRequest(
         List.of(
-            new ChatRequest.Message(ChatRequest.Role.developer, "You are a coding assistant"),
-            new ChatRequest.Message(ChatRequest.Role.user, "Write hello world")
+            new ChatRequest.Message(ChatRequest.Role.developer, "You are a coding assistant", null),
+            new ChatRequest.Message(ChatRequest.Role.user, "Write hello world", null)
         ),
         "gpt-4",
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
         null,
         null,
         false,
@@ -444,10 +565,16 @@ class OpenAIWebsocketHandlerTest {
 
     ChatRequest chatRequest = new ChatRequest(
         List.of(
-            new ChatRequest.Message(ChatRequest.Role.user, "Search for test"),
-            new ChatRequest.Message(ChatRequest.Role.tool_call, mapper.writeValueAsString(toolCallContent))
+            new ChatRequest.Message(ChatRequest.Role.user, "Search for test", null),
+            new ChatRequest.Message(ChatRequest.Role.tool_call, mapper.writeValueAsString(toolCallContent), null)
         ),
         "gpt-4",
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
         null,
         null,
         false,
@@ -485,11 +612,17 @@ class OpenAIWebsocketHandlerTest {
 
     ChatRequest chatRequest = new ChatRequest(
         List.of(
-            new ChatRequest.Message(ChatRequest.Role.user, "Search for test"),
-            new ChatRequest.Message(ChatRequest.Role.tool_call, mapper.writeValueAsString(toolCallContent)),
-            new ChatRequest.Message(ChatRequest.Role.tool_response, mapper.writeValueAsString(toolResponseContent))
+            new ChatRequest.Message(ChatRequest.Role.user, "Search for test", null),
+            new ChatRequest.Message(ChatRequest.Role.tool_call, mapper.writeValueAsString(toolCallContent), null),
+            new ChatRequest.Message(ChatRequest.Role.tool_response, mapper.writeValueAsString(toolResponseContent), null)
         ),
         "gpt-4",
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
         null,
         null,
         false,
@@ -524,10 +657,16 @@ class OpenAIWebsocketHandlerTest {
   void handle_invalidToolCallContent_throwsBadRequest() throws Exception {
     ChatRequest chatRequest = new ChatRequest(
         List.of(
-            new ChatRequest.Message(ChatRequest.Role.user, "Search for test"),
-            new ChatRequest.Message(ChatRequest.Role.tool_call, "not valid json")
+            new ChatRequest.Message(ChatRequest.Role.user, "Search for test", null),
+            new ChatRequest.Message(ChatRequest.Role.tool_call, "not valid json", null)
         ),
         "gpt-4",
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
         null,
         null,
         false,
@@ -548,11 +687,17 @@ class OpenAIWebsocketHandlerTest {
 
     ChatRequest chatRequest = new ChatRequest(
         List.of(
-            new ChatRequest.Message(ChatRequest.Role.user, "Search for test"),
-            new ChatRequest.Message(ChatRequest.Role.tool_call, mapper.writeValueAsString(toolCallContent)),
-            new ChatRequest.Message(ChatRequest.Role.tool_response, "not valid json")
+            new ChatRequest.Message(ChatRequest.Role.user, "Search for test", null),
+            new ChatRequest.Message(ChatRequest.Role.tool_call, mapper.writeValueAsString(toolCallContent), null),
+            new ChatRequest.Message(ChatRequest.Role.tool_response, "not valid json", null)
         ),
         "gpt-4",
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
         null,
         null,
         false,
@@ -571,8 +716,14 @@ class OpenAIWebsocketHandlerTest {
   @SuppressWarnings("unchecked")
   void handle_streamingWithToolCall_executesToolAndContinues() throws Exception {
     ChatRequest chatRequest = new ChatRequest(
-        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Search for cats")),
+        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Search for cats", null)),
         "gpt-4",
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
         null,
         null,
         true,
@@ -657,8 +808,14 @@ class OpenAIWebsocketHandlerTest {
   @SuppressWarnings("unchecked")
   void handle_streamingWithUnknownTool_logsWarningAndContinues() throws Exception {
     ChatRequest chatRequest = new ChatRequest(
-        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Do something")),
+        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Do something", null)),
         "gpt-4",
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
         null,
         null,
         true,
@@ -729,8 +886,14 @@ class OpenAIWebsocketHandlerTest {
   @SuppressWarnings("unchecked")
   void handle_emptyChunkChoices_skipsProcessing() throws Exception {
     ChatRequest chatRequest = new ChatRequest(
-        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello")),
+        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello", null)),
         "gpt-4",
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
         null,
         null,
         true,
@@ -779,8 +942,14 @@ class OpenAIWebsocketHandlerTest {
   @SuppressWarnings("unchecked")
   void handle_emptyContentInChunk_skipsOutput() throws Exception {
     ChatRequest chatRequest = new ChatRequest(
-        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello")),
+        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello", null)),
         "gpt-4",
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
         null,
         null,
         true,
@@ -840,8 +1009,14 @@ class OpenAIWebsocketHandlerTest {
     when(config.getMaxToolIterations()).thenReturn(2);
 
     ChatRequest chatRequest = new ChatRequest(
-        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Search for cats")),
+        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Search for cats", null)),
         "gpt-4",
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
         null,
         null,
         true,
@@ -939,8 +1114,14 @@ class OpenAIWebsocketHandlerTest {
     // With default max iterations (10), a single tool call followed by completion
     // should NOT include the wrap-up message
     ChatRequest chatRequest = new ChatRequest(
-        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Search for dogs")),
+        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Search for dogs", null)),
         "gpt-4",
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
         null,
         null,
         true,
@@ -1032,8 +1213,14 @@ class OpenAIWebsocketHandlerTest {
     when(config.getMaxToolIterations()).thenReturn(1);
 
     ChatRequest chatRequest = new ChatRequest(
-        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello")),
+        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello", null)),
         "gpt-4",
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
         null,
         null,
         true,
@@ -1095,8 +1282,14 @@ class OpenAIWebsocketHandlerTest {
   @SuppressWarnings("unchecked")
   void handle_streamingResponse_includesContextTokensInCompletion() throws Exception {
     ChatRequest chatRequest = new ChatRequest(
-        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello")),
+        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello", null)),
         "gpt-4",
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
         null,
         null,
         true,
@@ -1150,8 +1343,14 @@ class OpenAIWebsocketHandlerTest {
   @SuppressWarnings("unchecked")
   void handle_streamingResponseNoUsage_includesZeroContextTokens() throws Exception {
     ChatRequest chatRequest = new ChatRequest(
-        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello")),
+        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello", null)),
         "gpt-4",
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
         null,
         null,
         true,
@@ -1196,8 +1395,14 @@ class OpenAIWebsocketHandlerTest {
   @SuppressWarnings("unchecked")
   void handle_streamingRequestSetsIncludeUsage() throws Exception {
     ChatRequest chatRequest = new ChatRequest(
-        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello")),
+        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello", null)),
         "gpt-4",
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
         null,
         null,
         true,
@@ -1243,8 +1448,14 @@ class OpenAIWebsocketHandlerTest {
   @Test
   void handle_withRegisteredTools_addsToolsToParams() throws Exception {
     ChatRequest chatRequest = new ChatRequest(
-        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello")),
+        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello", null)),
         "gpt-4",
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
         null,
         null,
         false,

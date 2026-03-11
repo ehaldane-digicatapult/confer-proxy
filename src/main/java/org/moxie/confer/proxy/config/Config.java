@@ -13,6 +13,10 @@ import java.util.List;
 public class Config {
 
   @Inject
+  @ConfigProperty(name = "server.port", defaultValue = "8080")
+  private int serverPort;
+
+  @Inject
   @ConfigProperty(name = "jwt.secret")
   private String jwtSecret;
 
@@ -57,8 +61,21 @@ public class Config {
   private int doclingPort;
 
   @Inject
+  @ConfigProperty(name = "vllm.served.model.name")
+  private String vllmServedModelName;
+
+  @Inject
   @ConfigProperty(name = "vllm.max.model.len", defaultValue = "262144")
   private int maxContextTokens;
+
+  @Inject
+  @ConfigProperty(name = "s3.bucket")
+  private String s3Bucket;
+
+  @Inject
+  @ConfigProperty(name = "s3.region", defaultValue = "us-east-1")
+  private String s3Region;
+
 
   public List<String> getAllowedOrigins() {
     if (allowedOrigins == null) {
@@ -106,7 +123,23 @@ public class Config {
     return doclingPort;
   }
 
+  public String getVllmServedModelName() {
+    return vllmServedModelName;
+  }
+
   public int getMaxContextTokens() {
     return maxContextTokens;
+  }
+
+  public int getServerPort() {
+    return serverPort;
+  }
+
+  public String getS3Bucket() {
+    return s3Bucket;
+  }
+
+  public String getS3Region() {
+    return s3Region;
   }
 }
