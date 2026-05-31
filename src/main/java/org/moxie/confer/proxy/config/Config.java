@@ -37,6 +37,14 @@ public class Config {
   private String tavilyApiKey;
 
   @Inject
+  @ConfigProperty(name = "tavily.extract_depth", defaultValue = "advanced")
+  private String tavilyExtractDepth;
+
+  @Inject
+  @ConfigProperty(name = "tavily.search_depth", defaultValue = "basic")
+  private String tavilySearchDepth;
+
+  @Inject
   @ConfigProperty(name = "cors.allow-origins")
   private String allowedOrigins;
 
@@ -101,6 +109,14 @@ public class Config {
 
   public String getTavilyApiKey() {
     return tavilyApiKey;
+  }
+
+  public String getTavilyExtractDepth() {
+    return tavilyExtractDepth;
+  }
+
+  public String getTavilySearchDepth() {
+    return tavilySearchDepth;
   }
 
   public String getManifestPath() {

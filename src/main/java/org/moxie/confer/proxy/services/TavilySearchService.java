@@ -56,7 +56,7 @@ public class TavilySearchService {
         "api_key", config.getTavilyApiKey(),
         "query", query,
         "max_results", maxResults,
-        "search_depth", "basic",
+        "search_depth", config.getTavilySearchDepth(),
         "include_answer", false
     );
 
@@ -108,7 +108,7 @@ public class TavilySearchService {
     Map<String, Object> requestBody = Map.of(
         "api_key", config.getTavilyApiKey(),
         "urls", urls,
-        "extract_depth", "basic",
+        "extract_depth", config.getTavilyExtractDepth(),
         "format", "markdown"
     );
 

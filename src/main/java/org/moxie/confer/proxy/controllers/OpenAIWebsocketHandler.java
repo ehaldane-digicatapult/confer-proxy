@@ -134,10 +134,24 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
           sendToolCallToClient(req, output);
         }
 
+        boolean webSearchDisabled = chatRequest.webSearch() != null && !chatRequest.webSearch();
+
         for (ToolCallRequest req : toolCalls.serverToolCalls()) {
           Optional<Tool> tool = toolRegistry.getTool(req.functionName());
 
           if (tool.isPresent()) {
+            if (webSearchDisabled && tool.get().hasExternalRequests()) {
+              log.info("Skipping {} because web search is disabled", req.functionName());
+              String errorResult = "{\"error\": \"Web search is disabled for this conversation.\"}";
+
+              ChatCompletionToolMessageParam toolMessage = ChatCompletionToolMessageParam.builder()
+                                                                                         .toolCallId(req.id())
+                                                                                         .content(errorResult)
+                                                                                         .build();
+              conversationHistory.add(ChatCompletionMessageParam.ofTool(toolMessage));
+              continue;
+            }
+
             String fullResult   = tool.get().execute(req.arguments(), req.id(), output);
             String clientResult = tool.get().getClientResult(fullResult);
 
