@@ -45,6 +45,10 @@ public class Config {
   private String tavilySearchDepth;
 
   @Inject
+  @ConfigProperty(name = "corsfix_api_key", defaultValue = "")
+  private String corsfixApiKey;
+
+  @Inject
   @ConfigProperty(name = "cors.allow-origins")
   private String allowedOrigins;
 
@@ -117,6 +121,10 @@ public class Config {
 
   public String getTavilySearchDepth() {
     return tavilySearchDepth;
+  }
+
+  public String getCorsfixApiKey() {
+    return corsfixApiKey;
   }
 
   public String getManifestPath() {

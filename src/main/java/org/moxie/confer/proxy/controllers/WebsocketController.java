@@ -44,6 +44,9 @@ public class WebsocketController extends NoiseConnectionWebsocket {
   @Inject
   EmbeddingHandler embeddingHandler;
 
+  @Inject
+  ExternalProxyFetchHandler externalProxyFetchHandler;
+
   private final Map<Route, WebsocketHandler> routes         = new HashMap<>();
   private final StreamRegistry               streamRegistry = new StreamRegistry();
 
@@ -58,6 +61,7 @@ public class WebsocketController extends NoiseConnectionWebsocket {
     routes.put(new Route("POST", "/v1/vllm/chat/completions"), vllmWebsocketHandler);
     routes.put(new Route("POST", "/v1/document/extract"), documentExtractionHandler);
     routes.put(new Route("POST", "/v1/embeddings"), embeddingHandler);
+    routes.put(new Route("POST", "/v1/fetch/html"), externalProxyFetchHandler);
     routes.put(new Route("GET", "/ping"), pingWebsocketHandler);
   }
 
