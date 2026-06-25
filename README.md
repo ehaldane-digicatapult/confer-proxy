@@ -450,31 +450,19 @@ Tests use a random port (`server.port=-1`) to avoid conflicts. The test suite co
 - `StreamRegistry` / `StreamContext` - chunked upload reassembly, back-pressure
   limits, cancellation
 
-If a developer is working on a Linux machine and wants to check whether they are
-running on TEE-capable hardware:
+### Evaluating a host system
 
-# Check for TDX guest device (Intel TDX, inside the VM)
-ls /dev/tdx_guest 2>/dev/null && echo "TDX guest: present" || echo "TDX guest:
-absent"
+If a developer wants to check whether they are running on TEE-capable hardware,
+they can run any of the following in either a guest or host:
 
-# Check for SEV-SNP guest device (AMD SEV-SNP, inside the VM)
-ls /dev/sev-guest 2>/dev/null && echo "SEV-SNP guest: present" || echo "SEV-SNP
-guest: absent"
+- Check for TDX:
+`ls /dev/tdx_guest 2>/dev/null && echo "TDX guest: present"`
 
-# Check CPU flags for host-side TDX support (bare metal / hypervisor host)
-grep -m1 "^flags" /proc/cpuinfo | tr ' ' '\n' | grep -E "^(tdx|sev|sev_snp)$"
+- Check for SEV-SNP: `ls /dev/sev-guest 2>/dev/null && echo "SEV-SNP guest: present"`
 
-# Check kernel TSM sysfs interface (required by QuoteGenerator)
-ls /sys/kernel/config/tsm/report/ 2>/dev/null && echo "TSM sysfs: present" || echo
-"TSM sysfs: absent"
+- Check CPU flags for TDX support: `grep -m1 "^flags" /proc/cpuinfo | tr ' ' '\n' | grep -E "^(tdx|sev|sev_snp)$"`
 
-The proxy's QuoteGenerator uses the TSM sysfs path (/sys/kernel/config/tsm/report/),
-so the last check is actually the most directly relevant one. A standard Linux VM,
-including GitHub Actions ubuntu-latest, will show all four as absent and `mvn test`
-still passes because the tests mock everything above that layer.
-
-On macOS, none of these checks apply: Apple Silicon has its own Secure Enclave but
-it is not TDX or SEV-SNP and has no /dev/tdx_guest or /dev/sev-guest equivalent.
+- Check kernel TSM sysfs interface: `ls /sys/kernel/config/tsm/report/ 2>/dev/null && echo "TSM sysfs: present"`
 
 ### Protobuf
 
