@@ -7,7 +7,7 @@
 
     <groupId>org.moxie</groupId>
     <artifactId>proxy</artifactId>
-    <version>0.1.16</version>
+    <version>0.1.20</version>
     <packaging>jar</packaging>
 
     <properties>
@@ -17,9 +17,11 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <project.build.outputTimestamp>1990-01-01T00:00:00Z</project.build.outputTimestamp>
         <helidon.version>4.2.6</helidon.version>
+        <mockito.version>5.18.0</mockito.version>
         <mainClass>org.moxie.confer.proxy.Server</mainClass>
         <module.contentSha>unknown</module.contentSha>
         <s3.bucket>${env.S3_BUCKET}</s3.bucket>
+        <document.worker.python>python3.12</document.worker.python>
     </properties>
 
     <dependencyManagement>
@@ -66,6 +68,24 @@
         </dependency>
 
         <dependency>
+            <groupId>com.nimbusds</groupId>
+            <artifactId>nimbus-jose-jwt</artifactId>
+            <version>10.9.1</version>
+        </dependency>
+
+        <dependency>
+            <groupId>com.github.mwiede</groupId>
+            <artifactId>jsch</artifactId>
+            <version>2.28.4</version>
+        </dependency>
+
+        <dependency>
+            <groupId>dev.sigstore</groupId>
+            <artifactId>sigstore-java</artifactId>
+            <version>2.2.0</version>
+        </dependency>
+
+        <dependency>
             <groupId>io.helidon.webclient</groupId>
             <artifactId>helidon-webclient</artifactId>
         </dependency>
@@ -73,6 +93,11 @@
         <dependency>
             <groupId>io.helidon.microprofile.websocket</groupId>
             <artifactId>helidon-microprofile-websocket</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>io.helidon.microprofile.bean-validation</groupId>
+            <artifactId>helidon-microprofile-bean-validation</artifactId>
         </dependency>
 
         <dependency>
@@ -95,7 +120,7 @@
         <dependency>
             <groupId>com.google.protobuf</groupId>
             <artifactId>protobuf-java</artifactId>
-            <version>4.29.2</version>
+            <version>4.33.4</version>
         </dependency>
 
         <!-- Logging -->
@@ -137,13 +162,37 @@
         <dependency>
             <groupId>org.mockito</groupId>
             <artifactId>mockito-core</artifactId>
-            <version>5.10.0</version>
+            <version>${mockito.version}</version>
             <scope>test</scope>
         </dependency>
         <dependency>
             <groupId>org.mockito</groupId>
             <artifactId>mockito-junit-jupiter</artifactId>
-            <version>5.10.0</version>
+            <version>${mockito.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.sshd</groupId>
+            <artifactId>sshd-core</artifactId>
+            <version>2.19.0</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.sshd</groupId>
+            <artifactId>sshd-sftp</artifactId>
+            <version>2.19.0</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>net.i2p.crypto</groupId>
+            <artifactId>eddsa</artifactId>
+            <version>0.3.0</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.poi</groupId>
+            <artifactId>poi-ooxml</artifactId>
+            <version>5.5.1</version>
             <scope>test</scope>
         </dependency>
     </dependencies>
@@ -157,6 +206,14 @@
             </extension>
         </extensions>
         <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.2.5</version>
+                <configuration>
+                    <argLine>@{argLine} -javaagent:${settings.localRepository}/org/mockito/mockito-core/${mockito.version}/mockito-core-${mockito.version}.jar</argLine>
+                </configuration>
+            </plugin>
             <!-- Download embedding model at build time -->
             <plugin>
                 <groupId>io.github.download-maven-plugin</groupId>
@@ -238,6 +295,9 @@
                             <classpathPrefix>libs/</classpathPrefix>
                             <mainClass>${mainClass}</mainClass>
                         </manifest>
+                        <manifestEntries>
+                            <Enable-Native-Access>ALL-UNNAMED</Enable-Native-Access>
+                        </manifestEntries>
                     </archive>
                 </configuration>
             </plugin>
@@ -361,6 +421,58 @@
                         <version>3.1.0</version>
                         <executions>
                             <execution>
+                                <id>build-document-worker-runtime</id>
+                                <phase>prepare-package</phase>
+                                <goals>
+                                    <goal>exec</goal>
+                                </goals>
+                                <configuration>
+                                    <executable>${document.worker.python}</executable>
+                                    <arguments>
+                                        <argument>-m</argument>
+                                        <argument>pip</argument>
+                                        <argument>install</argument>
+                                        <argument>--disable-pip-version-check</argument>
+                                        <argument>--no-compile</argument>
+                                        <argument>--no-deps</argument>
+                                        <argument>--only-binary=:all:</argument>
+                                        <argument>--platform</argument>
+                                        <argument>manylinux_2_28_x86_64</argument>
+                                        <argument>--platform</argument>
+                                        <argument>manylinux_2_17_x86_64</argument>
+                                        <argument>--python-version</argument>
+                                        <argument>3.12</argument>
+                                        <argument>--implementation</argument>
+                                        <argument>cp</argument>
+                                        <argument>--abi</argument>
+                                        <argument>cp312</argument>
+                                        <argument>--require-hashes</argument>
+                                        <argument>--requirement</argument>
+                                        <argument>${project.basedir}/document-worker/requirements-runtime.txt</argument>
+                                        <argument>--target</argument>
+                                        <argument>${project.build.directory}/document-worker/runtime</argument>
+                                    </arguments>
+                                </configuration>
+                            </execution>
+                            <execution>
+                                <id>verify-document-worker-runtime</id>
+                                <phase>prepare-package</phase>
+                                <goals>
+                                    <goal>exec</goal>
+                                </goals>
+                                <configuration>
+                                    <executable>${document.worker.python}</executable>
+                                    <environmentVariables>
+                                        <PYTHONPATH>${project.build.directory}/document-worker/runtime${path.separator}${project.basedir}/document-worker/src</PYTHONPATH>
+                                    </environmentVariables>
+                                    <arguments>
+                                        <argument>-S</argument>
+                                        <argument>-c</argument>
+                                        <argument>from confer_document_worker.application import WorkerApplication; from docling.backend.msword_backend import MsWordDocumentBackend; from docling.backend.mspowerpoint_backend import MsPowerpointDocumentBackend; from docling.backend.msexcel_backend import MsExcelDocumentBackend</argument>
+                                    </arguments>
+                                </configuration>
+                            </execution>
+                            <execution>
                                 <id>upload-proxy-zip</id>
                                 <phase>package</phase>
                                 <goals>
@@ -378,9 +490,67 @@
                             </execution>
                         </executions>
                     </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-failsafe-plugin</artifactId>
+                        <version>3.2.5</version>
+                        <configuration>
+                            <systemPropertyVariables>
+                                <proxy.archive>${project.build.directory}/proxy-${project.version}.zip</proxy.archive>
+                            </systemPropertyVariables>
+                        </configuration>
+                        <executions>
+                            <execution>
+                                <goals>
+                                    <goal>integration-test</goal>
+                                    <goal>verify</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        <profile>
+            <id>dcap-integration</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>io.github.download-maven-plugin</groupId>
+                        <artifactId>download-maven-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>download-public-tdx-quote</id>
+                                <phase>generate-test-resources</phase>
+                                <goals>
+                                    <goal>wget</goal>
+                                </goals>
+                                <configuration>
+                                    <url>https://raw.githubusercontent.com/google/go-tdx-guest/2108462acb71e7fd471b9535e1af2895d747c7c1/testing/testdata/ccel/cos-113-tdx-quote.dat</url>
+                                    <outputDirectory>${project.build.directory}/dcap/test</outputDirectory>
+                                    <outputFileName>google-cos-113-tdx-quote.dat</outputFileName>
+                                    <sha256>54334c81b4e03634ab3a269ad397c9cea3b5c9ee96c57505b684470b964fd15e</sha256>
+                                    <alwaysVerifyChecksum>true</alwaysVerifyChecksum>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-surefire-plugin</artifactId>
+                        <configuration>
+                            <argLine>@{argLine} -javaagent:${settings.localRepository}/org/mockito/mockito-core/${mockito.version}/mockito-core-${mockito.version}.jar --enable-native-access=ALL-UNNAMED</argLine>
+                            <excludedEnvironmentVariables>
+                                <excludedEnvironmentVariable>LD_LIBRARY_PATH</excludedEnvironmentVariable>
+                            </excludedEnvironmentVariables>
+                            <systemPropertyVariables>
+                                <dcap.integration.enabled>true</dcap.integration.enabled>
+                                <dcap.integration.quote>${project.build.directory}/dcap/test/google-cos-113-tdx-quote.dat</dcap.integration.quote>
+                            </systemPropertyVariables>
+                        </configuration>
+                    </plugin>
                 </plugins>
             </build>
         </profile>
     </profiles>
 </project>
-

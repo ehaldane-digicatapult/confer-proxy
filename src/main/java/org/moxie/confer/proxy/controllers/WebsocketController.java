@@ -10,11 +10,12 @@ import jakarta.websocket.server.ServerEndpoint;
 import jakarta.ws.rs.WebApplicationException;
 import org.moxie.confer.proxy.attestation.AttestationService;
 import org.moxie.confer.proxy.auth.WebsocketAuthenticator;
+import org.moxie.confer.proxy.entities.InvalidWebsocketRequestException;
 import org.moxie.confer.proxy.entities.WebsocketRequest;
 import org.moxie.confer.proxy.entities.WebsocketResponse;
-import org.moxie.confer.proxy.streaming.StreamRegistry;
 import org.moxie.confer.proxy.websocket.NoiseConnectionWebsocket;
 import org.moxie.confer.proxy.websocket.Route;
+import org.moxie.confer.proxy.websocket.WebsocketConnectionContext;
 import org.moxie.confer.proxy.websocket.WebsocketHandler;
 import org.moxie.confer.proxy.websocket.WebsocketHandlerResponse;
 import org.slf4j.Logger;
@@ -30,7 +31,6 @@ import java.util.Map;
 public class WebsocketController extends NoiseConnectionWebsocket {
 
   private static final Logger log = LoggerFactory.getLogger(WebsocketController.class);
-
   @Inject
   @Named("vllm")
   OpenAIWebsocketHandler vllmWebsocketHandler;
@@ -42,13 +42,15 @@ public class WebsocketController extends NoiseConnectionWebsocket {
   DocumentExtractionHandler documentExtractionHandler;
 
   @Inject
+  LegacyDocumentExtractionHandler legacyDocumentExtractionHandler;
+
+  @Inject
   EmbeddingHandler embeddingHandler;
 
   @Inject
   ExternalProxyFetchHandler externalProxyFetchHandler;
 
-  private final Map<Route, WebsocketHandler> routes         = new HashMap<>();
-  private final StreamRegistry               streamRegistry = new StreamRegistry();
+  private final Map<Route, WebsocketHandler> routes = new HashMap<>();
 
   @Inject
   public WebsocketController(AttestationService attestationService, ObjectMapper mapper)
@@ -57,9 +59,10 @@ public class WebsocketController extends NoiseConnectionWebsocket {
   }
 
   @PostConstruct
-  private void initializeRoutes() {
+  void initializeRoutes() {
     routes.put(new Route("POST", "/v1/vllm/chat/completions"), vllmWebsocketHandler);
-    routes.put(new Route("POST", "/v1/document/extract"), documentExtractionHandler);
+    routes.put(new Route("POST", "/v1/document/extract"), legacyDocumentExtractionHandler);
+    routes.put(new Route("POST", "/v2/document/extract"), documentExtractionHandler);
     routes.put(new Route("POST", "/v1/embeddings"), embeddingHandler);
     routes.put(new Route("POST", "/v1/fetch/html"), externalProxyFetchHandler);
     routes.put(new Route("GET", "/ping"), pingWebsocketHandler);
@@ -68,7 +71,13 @@ public class WebsocketController extends NoiseConnectionWebsocket {
   @Override
   public void onClose(Session session, CloseReason closeReason) {
     super.onClose(session, closeReason);
-    streamRegistry.cancelAll();
+    closeConnectionContext(session);
+  }
+
+  @Override
+  public void onError(Session session, Throwable throwable) {
+    super.onError(session, throwable);
+    failConnection(session, "WebSocket error");
   }
 
   @Override
@@ -84,27 +93,28 @@ public class WebsocketController extends NoiseConnectionWebsocket {
           confer.NoiseTransport.WebsocketRequest.parseFrom(data);
 
       request = WebsocketRequest.fromProtobuf(protoRequest);
-    } catch (com.google.protobuf.InvalidProtocolBufferException e) {
-      log.warn("Failed to parse protobuf request", e);
+    } catch (com.google.protobuf.InvalidProtocolBufferException error) {
+      log.warn("Failed to parse protobuf request", error);
       closeQuiet(session, CloseReason.CloseCodes.CANNOT_ACCEPT, "Invalid protobuf message");
       return;
-    } catch (IllegalArgumentException e) {
-      log.warn("Invalid request: {}", e.getMessage());
-      closeQuiet(session, CloseReason.CloseCodes.CANNOT_ACCEPT, e.getMessage());
+    } catch (InvalidWebsocketRequestException error) {
+      log.warn("Invalid request: {}", error.getMessage());
+      closeQuiet(session, CloseReason.CloseCodes.CANNOT_ACCEPT, error.getMessage());
       return;
     }
 
-    // Handle stream continuation chunks (no verb/path, just id + chunk)
+    WebsocketConnectionContext context = getConnectionContext(session);
+    if (context == null) {
+      sendResponseError(session, request.id(), 401, "Authentication required");
+      return;
+    }
+
     if (request.isStreamContinuation()) {
-      handleStreamChunk(session, request);
+      handleStreamChunk(context, session, request);
       return;
     }
 
-    Instant tokenExpiry = (Instant) session.getUserProperties().get("tokenExpiry");
-    Boolean subscribed  = (Boolean) session.getUserProperties().get("subscribed" );
-    boolean isFreeTier  = subscribed == null || !subscribed;
-
-    if (isFreeTier && tokenExpiry != null && Instant.now().isAfter(tokenExpiry)) {
+    if (context.requiresPayment(Instant.now())) {
       sendResponseError(session, request.id(), 402, "Payment required");
       return;
     }
@@ -118,24 +128,36 @@ public class WebsocketController extends NoiseConnectionWebsocket {
       return;
     }
 
-    WebsocketHandlerResponse handlerResponse;
-
-    try {
-      handlerResponse = handler.handle(request, streamRegistry);
+    try (WebsocketHandlerResponse handlerResponse = handler.handle(context, request)) {
+      sendHandlerResponse(session, request.id(), handlerResponse);
     } catch (WebApplicationException e) {
       log.warn("Error processing request", e);
       sendResponseError(session, request.id(), e.getResponse().getStatus(), e.getMessage());
       return;
-    } catch (Exception e) {
+    } catch (RuntimeException e) {
       log.warn("Error processing request", e);
       sendResponseError(session, request.id(), 500, "Internal Server Error");
       return;
     }
-
-    sendHandlerResponse(session, request.id(), handlerResponse);
   }
 
-  private void handleStreamChunk(Session session, WebsocketRequest request) {
+  private static WebsocketConnectionContext getConnectionContext(Session session) {
+    Object value = session.getUserProperties().get(WebsocketConnectionContext.SESSION_PROPERTY);
+    return value instanceof WebsocketConnectionContext context ? context : null;
+  }
+
+  private static void closeConnectionContext(Session session) {
+    WebsocketConnectionContext context = getConnectionContext(session);
+
+    if (context != null) {
+      context.close();
+    }
+  }
+
+  private void handleStreamChunk(WebsocketConnectionContext context,
+                                 Session                    session,
+                                 WebsocketRequest           request)
+  {
     if (request.chunk().isEmpty()) {
       log.warn("Stream continuation without chunk data");
       sendResponseError(session, request.id(), 400, "Chunk data required");
@@ -144,13 +166,13 @@ public class WebsocketController extends NoiseConnectionWebsocket {
 
     try {
       WebsocketRequest.StreamChunk chunk = request.chunk().get();
-      streamRegistry.handleChunk(request.id(), chunk.data(), chunk.sequenceNumber(), chunk.isFinal());
+      context.getStreams().handleChunk(request.id(), chunk.data(), chunk.sequenceNumber(), chunk.isFinal());
     } catch (IllegalStateException e) {
       log.warn("Stream {} already completed", request.id());
       sendResponseError(session, request.id(), 400, "Stream already completed");
     } catch (IOException e) {
       log.warn("Error writing chunk", e);
-      streamRegistry.cancelStream(request.id());
+      context.getStreams().cancelStream(request.id());
       sendResponseError(session, request.id(), 500, "Stream write failed");
     }
   }
@@ -163,9 +185,8 @@ public class WebsocketController extends NoiseConnectionWebsocket {
           byte[] responseData = response.toProtobuf().toByteArray();
           sendMessage(session, responseData);
         }
-        case WebsocketHandlerResponse.StreamingResponse(Map<String, String> headers, jakarta.ws.rs.core.StreamingOutput stream) -> {
-          WebsocketOutputStream outputStream = new WebsocketOutputStream(session, requestId, headers);
-          stream.write(outputStream);
+        case WebsocketHandlerResponse.StreamingResponse response -> {
+          response.writeTo(new WebsocketOutputStream(session, requestId, response.headers()));
         }
       }
     } catch (WebApplicationException e) {
@@ -173,7 +194,7 @@ public class WebsocketController extends NoiseConnectionWebsocket {
       sendResponseError(session, requestId, e.getResponse().getStatus(), e.getMessage());
     } catch (IOException e) {
       log.warn("IOError processing response", e);
-      sendResponseError(session, requestId, 500, "IO Error");
+      failConnection(session, "Streaming response failed");
     }
   }
 
@@ -181,7 +202,22 @@ public class WebsocketController extends NoiseConnectionWebsocket {
     WebsocketResponse response   = new WebsocketResponse(id, status, message);
     byte[]            serialized = response.toProtobuf().toByteArray();
 
-    sendMessage(session, serialized);
+    try {
+      sendMessage(session, serialized);
+    } catch (IOException error) {
+      log.warn("Failed to send error response");
+      failConnection(session, "Response failed");
+    }
+  }
+
+  private void failConnection(Session session,
+                              String  reason)
+  {
+    closeConnectionContext(session);
+    closeQuiet(
+        session,
+        CloseReason.CloseCodes.UNEXPECTED_CONDITION,
+        reason);
   }
 
   private class WebsocketOutputStream extends OutputStream {

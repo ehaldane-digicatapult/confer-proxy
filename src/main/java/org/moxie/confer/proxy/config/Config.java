@@ -73,6 +73,18 @@ public class Config {
   private int doclingPort;
 
   @Inject
+  @ConfigProperty(name = "document.worker.socket", defaultValue = "/run/confer/document-worker.sock")
+  private String documentWorkerSocketPath;
+
+  @Inject
+  @ConfigProperty(name = "document.worker.max-connections", defaultValue = "8")
+  private int documentWorkerMaxConnections;
+
+  @Inject
+  @ConfigProperty(name = "document.worker.acquire-timeout-seconds", defaultValue = "1800")
+  private long documentWorkerAcquireTimeoutSeconds;
+
+  @Inject
   @ConfigProperty(name = "vllm.served.model.name")
   private String vllmServedModelName;
 
@@ -88,6 +100,9 @@ public class Config {
   @ConfigProperty(name = "s3.region", defaultValue = "us-east-1")
   private String s3Region;
 
+  @Inject
+  @ConfigProperty(name = "worker.controller.uri")
+  private String workerControllerUri;
 
   public List<String> getAllowedOrigins() {
     if (allowedOrigins == null) {
@@ -147,6 +162,18 @@ public class Config {
     return doclingPort;
   }
 
+  public String getDocumentWorkerSocketPath() {
+    return documentWorkerSocketPath;
+  }
+
+  public int getDocumentWorkerMaxConnections() {
+    return documentWorkerMaxConnections;
+  }
+
+  public long getDocumentWorkerAcquireTimeoutSeconds() {
+    return documentWorkerAcquireTimeoutSeconds;
+  }
+
   public String getVllmServedModelName() {
     return vllmServedModelName;
   }
@@ -165,5 +192,9 @@ public class Config {
 
   public String getS3Region() {
     return s3Region;
+  }
+
+  public String getWorkerControllerUri() {
+    return workerControllerUri;
   }
 }
