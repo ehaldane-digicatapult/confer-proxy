@@ -1710,7 +1710,7 @@ class OpenAIWebsocketHandlerTest {
   }
 
   @Test
-  void handle_nonStreamingRequestOmitsServerAndClientTools() throws Exception {
+  void handle_nonStreamingRequestRendersToolsWithToolChoiceNone() throws Exception {
     ChatRequest chatRequest = new ChatRequest(
         List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello", null)),
         "gpt-4",
@@ -1746,14 +1746,61 @@ class OpenAIWebsocketHandlerTest {
 
     Tool tool1 = mock(Tool.class);
     Tool tool2 = mock(Tool.class);
+    when(tool1.getFunctionDefinition()).thenReturn(FunctionDefinition.builder().name("tool1").build());
+    when(tool2.getFunctionDefinition()).thenReturn(FunctionDefinition.builder().name("tool2").build());
     useServerTools(Map.of("tool1", tool1, "tool2", tool2));
 
     handler.handle(requestContext, request);
 
-    verify(completionService).create(argThat((ChatCompletionCreateParams params) ->
-        params.tools().isEmpty() || params.tools().get().isEmpty()
-    ));
-    verifyNoInteractions(toolRegistry);
+    // The same tools a streamed chat would render, so a follow-up shares its
+    // prompt prefix, with tool_choice none since nothing here can run a call.
+    ArgumentCaptor<ChatCompletionCreateParams> captor = ArgumentCaptor.forClass(ChatCompletionCreateParams.class);
+    verify(completionService).create(captor.capture());
+    ChatCompletionCreateParams params = captor.getValue();
+    assertEquals(3, params.tools().orElseThrow().size());
+    assertEquals(ChatCompletionToolChoiceOption.Auto.NONE, params.toolChoice().orElseThrow().asAuto());
+    verify(toolRegistry).forRequest(any(ToolEligibility.class));
+  }
+
+  @Test
+  void handle_nonStreamingRequestWithoutToolsSetsNoToolChoice() throws Exception {
+    ChatRequest chatRequest = new ChatRequest(
+        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello", null)),
+        "gpt-4",
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        false,
+        null,
+        null,
+        false,
+        null
+    );
+    WebsocketRequest request = new WebsocketRequest(1L, "POST", "/v1/chat/completions", Optional.of(mapper.writeValueAsString(chatRequest)));
+
+    ChatCompletion mockCompletion = mock(ChatCompletion.class);
+    ChatCompletion.Choice mockChoice = mock(ChatCompletion.Choice.class);
+    ChatCompletionMessage mockMessage = mock(ChatCompletionMessage.class);
+
+    when(openAIClient.chat()).thenReturn(chatService);
+    when(chatService.completions()).thenReturn(completionService);
+    when(completionService.create(any(ChatCompletionCreateParams.class))).thenReturn(mockCompletion);
+    when(mockCompletion.choices()).thenReturn(List.of(mockChoice));
+    when(mockChoice.message()).thenReturn(mockMessage);
+    when(mockMessage.content()).thenReturn(Optional.of("response"));
+
+    handler.handle(requestContext, request);
+
+    ArgumentCaptor<ChatCompletionCreateParams> captor = ArgumentCaptor.forClass(ChatCompletionCreateParams.class);
+    verify(completionService).create(captor.capture());
+    ChatCompletionCreateParams params = captor.getValue();
+    assertTrue(params.tools().isEmpty() || params.tools().get().isEmpty());
+    assertTrue(params.toolChoice().isEmpty());
   }
 
   @Test

@@ -128,8 +128,13 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
     }
   }
 
+  // No tool loop runs on this path, but the request's tool definitions still
+  // belong in the prompt: a follow-up on a streamed chat (its title, its memory
+  // extraction) shares that chat's prompt prefix only if the template renders
+  // the same tools. tool_choice "none" keeps the model from calling any.
   private String handleNonStreamingRequest(ChatModel model, ChatRequest chatRequest) {
-    ChatCompletionCreateParams params = buildCompletionParams(model, chatRequest, new ArrayList<>(), false, RequestToolSet.empty());
+    RequestToolSet serverTools = toolRegistry.forRequest(toolEligibility(chatRequest));
+    ChatCompletionCreateParams params = buildCompletionParams(model, chatRequest, new ArrayList<>(), true, serverTools);
     try {
       return client.chat().completions().create(params).choices().getFirst().message().content().orElse("");
     } catch (BadRequestException error) {
@@ -394,7 +399,11 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
     }
 
     if (includeTools) {
-      addToolsToBuilder(builder, chatRequest.clientTools(), serverTools);
+      boolean added = addToolsToBuilder(builder, chatRequest.clientTools(), serverTools);
+
+      if (added && !chatRequest.stream()) {
+        builder.toolChoice(ChatCompletionToolChoiceOption.ofAuto(ChatCompletionToolChoiceOption.Auto.NONE));
+      }
     }
 
     return builder.build();
@@ -404,14 +413,18 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
     return message.imageRefs() != null && !message.imageRefs().isEmpty();
   }
 
-  private void addToolsToBuilder(ChatCompletionCreateParams.Builder builder,
-                                 List<ChatRequest.ClientTool> clientTools,
-                                 RequestToolSet serverTools)
+  // Returns whether any tool definition was added.
+  private boolean addToolsToBuilder(ChatCompletionCreateParams.Builder builder,
+                                    List<ChatRequest.ClientTool> clientTools,
+                                    RequestToolSet serverTools)
   {
+    boolean added = false;
+
     for (Tool tool : serverTools.values()) {
       builder.addTool(ChatCompletionFunctionTool.builder()
                                                 .function(tool.getFunctionDefinition())
                                                 .build());
+      added = true;
     }
 
     if (clientTools != null) {
@@ -433,8 +446,11 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
                                                       .parameters(paramsBuilder.build())
                                                       .build())
                                                   .build());
+        added = true;
       }
     }
+
+    return added;
   }
 
   private ChatCompletionMessageParam buildAssistantMessageWithToolCalls(List<ToolCallRequest> toolCalls) {
