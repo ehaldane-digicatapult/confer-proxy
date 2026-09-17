@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.openai.client.OpenAIClient;
 import com.openai.core.JsonValue;
 import com.openai.core.http.StreamResponse;
+import com.openai.errors.BadRequestException;
 import com.openai.models.ChatModel;
 import com.openai.models.FunctionDefinition;
 import com.openai.models.FunctionParameters;
@@ -14,6 +15,7 @@ import com.openai.models.chat.completions.ChatCompletionChunk;
 import com.openai.models.chat.completions.ChatCompletionCreateParams;
 import com.openai.models.chat.completions.ChatCompletionFunctionTool;
 import com.openai.models.chat.completions.ChatCompletionStreamOptions;
+import com.openai.models.chat.completions.ChatCompletionToolChoiceOption;
 import com.openai.models.chat.completions.ChatCompletionMessageFunctionToolCall;
 import com.openai.models.chat.completions.ChatCompletionMessageParam;
 import com.openai.models.chat.completions.ChatCompletionMessageToolCall;
@@ -60,6 +62,8 @@ import java.util.stream.Gatherers;
 public class OpenAIWebsocketHandler implements WebsocketHandler {
 
   private static final Logger log = LoggerFactory.getLogger(OpenAIWebsocketHandler.class);
+
+  private static final String CONTEXT_LENGTH_MESSAGE = "maximum context length";
 
   private final OpenAIClient               client;
   private final ObjectMapper               mapper;
@@ -126,7 +130,24 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
 
   private String handleNonStreamingRequest(ChatModel model, ChatRequest chatRequest) {
     ChatCompletionCreateParams params = buildCompletionParams(model, chatRequest, new ArrayList<>(), false, RequestToolSet.empty());
-    return client.chat().completions().create(params).choices().getFirst().message().content().orElse("");
+    try {
+      return client.chat().completions().create(params).choices().getFirst().message().content().orElse("");
+    } catch (BadRequestException error) {
+      throw translateBadRequest(error);
+    }
+  }
+
+  // vLLM reports a prompt that does not fit as a generic 400 whose only
+  // distinguishing feature is its message ("This model's maximum context
+  // length is ..."). Surface that case as 413 so the client can compact and
+  // retry; every other engine rejection stays a 400 rather than a 500.
+  private static WebApplicationException translateBadRequest(BadRequestException error) {
+    String message = Optional.ofNullable(error.getMessage()).orElse("").toLowerCase(Locale.ROOT);
+    if (message.contains(CONTEXT_LENGTH_MESSAGE)) {
+      return new WebApplicationException("Context length exceeded", 413);
+    }
+    log.warn("Engine rejected completion request (status {})", error.statusCode());
+    return new WebApplicationException("Invalid completion request", 400);
   }
 
   private void handleStreamingResponse(WebsocketConnectionContext context,
@@ -167,6 +188,8 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
 
         try (StreamResponse<ChatCompletionChunk> response = client.chat().completions().createStreaming(params)) {
           response.stream().forEach(chunk -> processor.processChunk(chunk, output));
+        } catch (BadRequestException error) {
+          throw translateBadRequest(error);
         }
 
         contextTokens = processor.getUsage().map(CompletionUsage::totalTokens).orElse(0L);
@@ -308,6 +331,10 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
 
     if (chatRequest.json() != null && chatRequest.json()) {
       builder.responseFormat(ResponseFormatJsonObject.builder().build());
+    }
+
+    if ("none".equals(chatRequest.toolChoice())) {
+      builder.toolChoice(ChatCompletionToolChoiceOption.ofAuto(ChatCompletionToolChoiceOption.Auto.NONE));
     }
 
     for (ChatRequest.Message message : chatRequest.messages()) {
