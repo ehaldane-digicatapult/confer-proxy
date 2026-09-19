@@ -14,12 +14,17 @@ import org.moxie.confer.proxy.tools.ToolResult;
 import org.moxie.confer.proxy.workers.WorkerCommandResult;
 import org.moxie.confer.proxy.workers.WorkerException;
 import org.moxie.confer.proxy.workers.WorkerWorkspace;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 @ApplicationScoped
 public class ExecCommandTool implements Tool {
+
+  private static final Logger log = LoggerFactory.getLogger(ExecCommandTool.class);
 
   private static final String NAME = "exec_command";
   private static final String ERROR = "{\"error\":\"Worker execution failed\"}";
@@ -97,24 +102,38 @@ public class ExecCommandTool implements Tool {
     try {
       ExecCommandArguments request = mapper.readValue(arguments, ExecCommandArguments.class);
 
-      if (request == null || request.inputs() == null || request.inputs().contains(null)) {
-        return ToolResult.text(ERROR);
+      if (request == null || request.cmd() == null || request.cmd().isBlank()) {
+        return invalidArguments("cmd is required");
+      }
+
+      List<ExecCommandInput> bindings = request.inputs() == null ? List.of() : request.inputs();
+
+      if (bindings.stream().anyMatch(Objects::isNull)) {
+        return invalidArguments("inputs must not contain null");
       }
 
       List<WorkerWorkspace.Input> inputs =
-          request.inputs()
-                 .stream()
-                 .map(input -> new WorkerWorkspace.Input(input.attachmentId(), input.path()))
-                 .toList();
+          bindings.stream()
+                  .map(input -> new WorkerWorkspace.Input(input.attachmentId(), input.path()))
+                  .toList();
 
       WorkerCommandResult result = context.getWorkerWorkspace().execute(request.cmd(), inputs, context.getDocumentSession());
 
       return ToolResult.text(mapper.writeValueAsString(new ExecCommandResult(result.exitCode(), result.output(), result.truncated())));
     } catch (WorkerException error) {
+      log.warn("Worker command failed: {}", error.getMessage());
       return failure(error.getMessage());
-    } catch (JsonProcessingException | IllegalArgumentException | IllegalStateException error) {
+    } catch (JsonProcessingException error) {
+      return invalidArguments("arguments must be a JSON object matching the tool schema");
+    } catch (IllegalArgumentException | IllegalStateException error) {
+      log.warn("Worker command failed ({})", error.getClass().getSimpleName());
       return ToolResult.text(ERROR);
     }
+  }
+
+  private ToolResult invalidArguments(String reason) {
+    log.warn("Rejected exec_command arguments: {}", reason);
+    return failure("Invalid arguments: " + reason);
   }
 
   private ToolResult failure(String details) {
