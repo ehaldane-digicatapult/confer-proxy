@@ -100,13 +100,17 @@ class PublishFileToolTest {
   }
 
   @Test
-  void rejectsMalformedArgumentsBeforeUsingTheWorker() {
+  void rejectsMalformedArgumentsBeforeUsingTheWorker() throws Exception {
     for (String arguments : List.of(
         "not-json",
-        "null")) {
-      ToolResult result = tool.execute(arguments, context);
+        "null",
+        "{}",
+        "{\"path\":\" \"}")) {
+      ToolResult result  = tool.execute(arguments, context);
+      JsonNode   content = mapper.readTree(result.modelContent());
 
-      assertEquals(ERROR, result.modelContent());
+      assertEquals("File publication failed", content.path("error").asText());
+      assertTrue(content.path("details").asText().startsWith("Invalid arguments: "));
       assertEquals(ERROR, result.clientContent());
       assertTrue(result.images().isEmpty());
     }

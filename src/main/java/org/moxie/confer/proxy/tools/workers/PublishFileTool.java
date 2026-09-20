@@ -14,12 +14,16 @@ import org.moxie.confer.proxy.tools.ToolExecutionContext;
 import org.moxie.confer.proxy.tools.ToolResult;
 import org.moxie.confer.proxy.workers.WorkerException;
 import org.moxie.confer.proxy.workers.WorkerWorkspace;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.List;
 import java.util.Map;
 
 @ApplicationScoped
 public class PublishFileTool implements Tool {
+
+  private static final Logger log = LoggerFactory.getLogger(PublishFileTool.class);
 
   private static final String NAME = "publish_file";
   private static final String ERROR = "{\"error\":\"File publication failed\"}";
@@ -63,8 +67,8 @@ public class PublishFileTool implements Tool {
       PublishFileArguments request = mapper.readValue(
           arguments,
           PublishFileArguments.class);
-      if (request == null) {
-        return ToolResult.text(ERROR);
+      if (request == null || request.path() == null || request.path().isBlank()) {
+        return invalidArguments("path is required");
       }
       AttachmentReference reference = context.getWorkerWorkspace().publishFile(request.path());
       String content = mapper.writeValueAsString(new PublishFileResult(
@@ -78,10 +82,19 @@ public class PublishFileTool implements Tool {
           List.of(),
           List.of(reference));
     } catch (WorkerException error) {
+      log.warn("Worker file publication failed: {}", error.getMessage());
       return failure(error.getMessage());
-    } catch (JsonProcessingException | IllegalArgumentException | IllegalStateException error) {
+    } catch (JsonProcessingException error) {
+      return invalidArguments("arguments must be a JSON object matching the tool schema");
+    } catch (IllegalArgumentException | IllegalStateException error) {
+      log.warn("Worker file publication failed ({})", error.getClass().getSimpleName());
       return ToolResult.text(ERROR);
     }
+  }
+
+  private ToolResult invalidArguments(String reason) {
+    log.warn("Rejected publish_file arguments: {}", reason);
+    return failure("Invalid arguments: " + reason);
   }
 
   private ToolResult failure(String details) {

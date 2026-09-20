@@ -528,6 +528,37 @@ class WebsocketControllerTest {
   }
 
   @Test
+  void onReceiveMessage_clientDisconnectDuringStreamingEndsTheRequestQuietly() throws Exception {
+    CountDownLatch  resourceClosed = new CountDownLatch(1);
+    ManagedResource resource       = resourceClosed::countDown;
+
+    when(session.isOpen()).thenReturn(false);
+    doThrow(new IllegalStateException("The connection has been closed."))
+        .when(basicRemote).sendBinary(any(ByteBuffer.class));
+
+    WebsocketHandler streamingHandler = (connectionContext, request) -> {
+      return WebsocketHandlerResponse.StreamingResponse.using(() -> resource, (ignored, output) -> {
+        try {
+          output.write("token".getBytes());
+        } catch (IOException error) {
+          throw new WebApplicationException("Streaming error", error, 500);
+        }
+      });
+    };
+
+    controller.setRoutes(Map.of(
+        new org.moxie.confer.proxy.websocket.Route("GET", "/stream"), streamingHandler
+    ));
+
+    byte[] request = createProtobufRequest(1, "GET", "/stream", null);
+    controller.testOnReceiveMessage(session, request);
+
+    assertTrue(resourceClosed.await(5, TimeUnit.SECONDS), "Disconnected streaming resource should close");
+    verify(basicRemote, after(300).times(1)).sendBinary(any(ByteBuffer.class));
+    verify(session, never()).close(any(CloseReason.class));
+  }
+
+  @Test
   void onClose_closesWorkerWorkspace() throws Exception {
     WorkerWorkspace workerWorkspace = mock(WorkerWorkspace.class);
     WebsocketConnectionContext context = (WebsocketConnectionContext) session

@@ -45,6 +45,7 @@ import org.moxie.confer.proxy.tools.ToolResult;
 import org.moxie.confer.proxy.tools.registry.RequestToolSet;
 import org.moxie.confer.proxy.tools.registry.ToolEligibility;
 import org.moxie.confer.proxy.tools.registry.ToolRegistry;
+import org.moxie.confer.proxy.websocket.ClientDisconnectedException;
 import org.moxie.confer.proxy.websocket.WebsocketConnectionContext;
 import org.moxie.confer.proxy.websocket.WebsocketHandler;
 import org.moxie.confer.proxy.websocket.WebsocketHandlerResponse;
@@ -64,6 +65,7 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
   private static final Logger log = LoggerFactory.getLogger(OpenAIWebsocketHandler.class);
 
   private static final String CONTEXT_LENGTH_MESSAGE = "maximum context length";
+  private static final String UNKNOWN_TOOL_ERROR     = "{\"error\":\"This tool is not available in this conversation\"}";
 
   private final OpenAIClient               client;
   private final ObjectMapper               mapper;
@@ -262,11 +264,21 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
 
     if (tool.isEmpty()) {
       log.warn("Unknown tool function: {}", request.functionName());
-      return Optional.empty();
+      return Optional.of(new ExecutedToolCall(request, ToolResult.text(UNKNOWN_TOOL_ERROR)));
     }
 
     ToolResult result = tool.orElseThrow().execute(request.arguments(), context);
     return Optional.of(new ExecutedToolCall(request, result));
+  }
+
+  private WebApplicationException streamingFailure(String      description,
+                                                   IOException error)
+  {
+    if (!(error instanceof ClientDisconnectedException)) {
+      log.warn("{}: {}", description, error.getMessage());
+    }
+
+    return new WebApplicationException("Streaming error", error, Response.Status.INTERNAL_SERVER_ERROR);
   }
 
   private ToolEligibility toolEligibility(ChatRequest request) {
@@ -486,8 +498,7 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
       output.write(message.getBytes());
       output.flush();
     } catch (IOException e) {
-      log.warn("Error sending tool call message: {}", e.getMessage());
-      throw new WebApplicationException("Streaming error", Response.Status.INTERNAL_SERVER_ERROR);
+      throw streamingFailure("Error sending tool call message", e);
     }
   }
 
@@ -503,8 +514,7 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
       output.write(message.getBytes());
       output.flush();
     } catch (IOException e) {
-      log.warn("Error sending client tool call message: {}", e.getMessage());
-      throw new WebApplicationException("Streaming error", Response.Status.INTERNAL_SERVER_ERROR);
+      throw streamingFailure("Error sending client tool call message", e);
     }
   }
 
@@ -539,8 +549,7 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
       output.write(message.getBytes());
       output.flush();
     } catch (IOException e) {
-      log.warn("Error sending tool response message: {}", e.getMessage());
-      throw new WebApplicationException("Streaming error", Response.Status.INTERNAL_SERVER_ERROR);
+      throw streamingFailure("Error sending tool response message", e);
     }
   }
 
@@ -560,8 +569,7 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
       output.write(completionMessage.getBytes());
       output.flush();
     } catch (IOException e) {
-      log.warn("Error sending stream completion signal: {}", e.getMessage());
-      throw new WebApplicationException("Streaming error", Response.Status.INTERNAL_SERVER_ERROR);
+      throw streamingFailure("Error sending stream completion signal", e);
     }
   }
 
@@ -629,8 +637,7 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
           streamContentToOutput(content, output);
         }
       } catch (IOException e) {
-        log.error("Error streaming OpenAI response: {}", e.getMessage());
-        throw new WebApplicationException("Streaming error", Response.Status.INTERNAL_SERVER_ERROR);
+        throw streamingFailure("Error streaming OpenAI response", e);
       }
     }
 

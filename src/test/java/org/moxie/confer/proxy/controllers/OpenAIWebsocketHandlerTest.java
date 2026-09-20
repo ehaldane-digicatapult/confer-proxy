@@ -14,6 +14,7 @@ import com.openai.models.chat.completions.ChatCompletionContentPart;
 import com.openai.models.chat.completions.ChatCompletionCreateParams;
 import com.openai.models.chat.completions.ChatCompletionMessage;
 import com.openai.models.chat.completions.ChatCompletionMessageParam;
+import com.openai.models.chat.completions.ChatCompletionToolMessageParam;
 import com.openai.models.chat.completions.ChatCompletionUserMessageParam;
 import com.openai.models.completions.CompletionUsage;
 import com.openai.services.blocking.ChatService;
@@ -1082,7 +1083,7 @@ class OpenAIWebsocketHandlerTest {
 
   @Test
   @SuppressWarnings("unchecked")
-  void handle_streamingWithUnknownTool_logsWarningAndContinues() throws Exception {
+  void handle_streamingWithUnknownTool_tellsTheModelTheToolIsUnavailable() throws Exception {
     ChatRequest chatRequest = new ChatRequest(
         List.of(new ChatRequest.Message(ChatRequest.Role.user, "Do something", null)),
         "gpt-4",
@@ -1150,8 +1151,15 @@ class OpenAIWebsocketHandlerTest {
 
     String output = outputStream.toString();
 
-    // Should still complete, even with unknown tool
+    ArgumentCaptor<ChatCompletionCreateParams> params =
+        ArgumentCaptor.forClass(ChatCompletionCreateParams.class);
+    verify(completionService, times(2)).createStreaming(params.capture());
+    ChatCompletionToolMessageParam toolMessage = params.getAllValues().get(1).messages().getLast().asTool();
+
+    assertEquals("call_unknown", toolMessage.toolCallId());
+    assertTrue(toolMessage.content().asText().contains("not available"));
     assertTrue(output.contains("\"type\":\"tool_call\""));
+    assertTrue(output.contains("\"type\":\"tool_response\""));
     assertTrue(output.contains("\"type\":\"completion\""));
   }
 
