@@ -13,6 +13,7 @@ import org.moxie.confer.proxy.auth.WebsocketAuthenticator;
 import org.moxie.confer.proxy.entities.InvalidWebsocketRequestException;
 import org.moxie.confer.proxy.entities.WebsocketRequest;
 import org.moxie.confer.proxy.entities.WebsocketResponse;
+import org.moxie.confer.proxy.websocket.ClientDisconnectedException;
 import org.moxie.confer.proxy.websocket.NoiseConnectionWebsocket;
 import org.moxie.confer.proxy.websocket.Route;
 import org.moxie.confer.proxy.websocket.WebsocketConnectionContext;
@@ -131,8 +132,7 @@ public class WebsocketController extends NoiseConnectionWebsocket {
     try (WebsocketHandlerResponse handlerResponse = handler.handle(context, request)) {
       sendHandlerResponse(session, request.id(), handlerResponse);
     } catch (WebApplicationException e) {
-      log.warn("Error processing request", e);
-      sendResponseError(session, request.id(), e.getResponse().getStatus(), e.getMessage());
+      handleRequestFailure(session, request.id(), e);
       return;
     } catch (RuntimeException e) {
       log.warn("Error processing request", e);
@@ -190,12 +190,33 @@ public class WebsocketController extends NoiseConnectionWebsocket {
         }
       }
     } catch (WebApplicationException e) {
-      log.warn("Error during streaming response", e);
-      sendResponseError(session, requestId, e.getResponse().getStatus(), e.getMessage());
+      handleRequestFailure(session, requestId, e);
+    } catch (ClientDisconnectedException e) {
+      log.debug("Client disconnected during response");
     } catch (IOException e) {
       log.warn("IOError processing response", e);
       failConnection(session, "Streaming response failed");
     }
+  }
+
+  private void handleRequestFailure(Session                 session,
+                                    long                    id,
+                                    WebApplicationException error)
+  {
+    if (error.getCause() instanceof ClientDisconnectedException) {
+      log.debug("Client disconnected during request");
+      return;
+    }
+
+    int status = error.getResponse().getStatus();
+
+    if (status >= 500) {
+      log.warn("Error processing request", error);
+    } else {
+      log.warn("Request rejected (status {}): {}", status, error.getMessage());
+    }
+
+    sendResponseError(session, id, status, error.getMessage());
   }
 
   private void sendResponseError(Session session, long id, int status, String message) {
@@ -204,6 +225,8 @@ public class WebsocketController extends NoiseConnectionWebsocket {
 
     try {
       sendMessage(session, serialized);
+    } catch (ClientDisconnectedException error) {
+      log.debug("Client disconnected before error response");
     } catch (IOException error) {
       log.warn("Failed to send error response");
       failConnection(session, "Response failed");

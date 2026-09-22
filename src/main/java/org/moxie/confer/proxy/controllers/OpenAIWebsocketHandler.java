@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.openai.client.OpenAIClient;
 import com.openai.core.JsonValue;
 import com.openai.core.http.StreamResponse;
+import com.openai.errors.BadRequestException;
 import com.openai.models.ChatModel;
 import com.openai.models.FunctionDefinition;
 import com.openai.models.FunctionParameters;
@@ -14,6 +15,7 @@ import com.openai.models.chat.completions.ChatCompletionChunk;
 import com.openai.models.chat.completions.ChatCompletionCreateParams;
 import com.openai.models.chat.completions.ChatCompletionFunctionTool;
 import com.openai.models.chat.completions.ChatCompletionStreamOptions;
+import com.openai.models.chat.completions.ChatCompletionToolChoiceOption;
 import com.openai.models.chat.completions.ChatCompletionMessageFunctionToolCall;
 import com.openai.models.chat.completions.ChatCompletionMessageParam;
 import com.openai.models.chat.completions.ChatCompletionMessageToolCall;
@@ -43,6 +45,7 @@ import org.moxie.confer.proxy.tools.ToolResult;
 import org.moxie.confer.proxy.tools.registry.RequestToolSet;
 import org.moxie.confer.proxy.tools.registry.ToolEligibility;
 import org.moxie.confer.proxy.tools.registry.ToolRegistry;
+import org.moxie.confer.proxy.websocket.ClientDisconnectedException;
 import org.moxie.confer.proxy.websocket.WebsocketConnectionContext;
 import org.moxie.confer.proxy.websocket.WebsocketHandler;
 import org.moxie.confer.proxy.websocket.WebsocketHandlerResponse;
@@ -60,6 +63,9 @@ import java.util.stream.Gatherers;
 public class OpenAIWebsocketHandler implements WebsocketHandler {
 
   private static final Logger log = LoggerFactory.getLogger(OpenAIWebsocketHandler.class);
+
+  private static final String CONTEXT_LENGTH_MESSAGE = "maximum context length";
+  private static final String UNKNOWN_TOOL_ERROR     = "{\"error\":\"This tool is not available in this conversation\"}";
 
   private final OpenAIClient               client;
   private final ObjectMapper               mapper;
@@ -124,9 +130,31 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
     }
   }
 
+  // No tool loop runs on this path, but the request's tool definitions still
+  // belong in the prompt: a follow-up on a streamed chat (its title, its memory
+  // extraction) shares that chat's prompt prefix only if the template renders
+  // the same tools. tool_choice "none" keeps the model from calling any.
   private String handleNonStreamingRequest(ChatModel model, ChatRequest chatRequest) {
-    ChatCompletionCreateParams params = buildCompletionParams(model, chatRequest, new ArrayList<>(), false, RequestToolSet.empty());
-    return client.chat().completions().create(params).choices().getFirst().message().content().orElse("");
+    RequestToolSet serverTools = toolRegistry.forRequest(toolEligibility(chatRequest));
+    ChatCompletionCreateParams params = buildCompletionParams(model, chatRequest, new ArrayList<>(), true, serverTools);
+    try {
+      return client.chat().completions().create(params).choices().getFirst().message().content().orElse("");
+    } catch (BadRequestException error) {
+      throw translateBadRequest(error);
+    }
+  }
+
+  // vLLM reports a prompt that does not fit as a generic 400 whose only
+  // distinguishing feature is its message ("This model's maximum context
+  // length is ..."). Surface that case as 413 so the client can compact and
+  // retry; every other engine rejection stays a 400 rather than a 500.
+  private static WebApplicationException translateBadRequest(BadRequestException error) {
+    String message = Optional.ofNullable(error.getMessage()).orElse("").toLowerCase(Locale.ROOT);
+    if (message.contains(CONTEXT_LENGTH_MESSAGE)) {
+      return new WebApplicationException("Context length exceeded", 413);
+    }
+    log.warn("Engine rejected completion request (status {})", error.statusCode());
+    return new WebApplicationException("Invalid completion request", 400);
   }
 
   private void handleStreamingResponse(WebsocketConnectionContext context,
@@ -167,6 +195,8 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
 
         try (StreamResponse<ChatCompletionChunk> response = client.chat().completions().createStreaming(params)) {
           response.stream().forEach(chunk -> processor.processChunk(chunk, output));
+        } catch (BadRequestException error) {
+          throw translateBadRequest(error);
         }
 
         contextTokens = processor.getUsage().map(CompletionUsage::totalTokens).orElse(0L);
@@ -234,11 +264,21 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
 
     if (tool.isEmpty()) {
       log.warn("Unknown tool function: {}", request.functionName());
-      return Optional.empty();
+      return Optional.of(new ExecutedToolCall(request, ToolResult.text(UNKNOWN_TOOL_ERROR)));
     }
 
     ToolResult result = tool.orElseThrow().execute(request.arguments(), context);
     return Optional.of(new ExecutedToolCall(request, result));
+  }
+
+  private WebApplicationException streamingFailure(String      description,
+                                                   IOException error)
+  {
+    if (!(error instanceof ClientDisconnectedException)) {
+      log.warn("{}: {}", description, error.getMessage());
+    }
+
+    return new WebApplicationException("Streaming error", error, Response.Status.INTERNAL_SERVER_ERROR);
   }
 
   private ToolEligibility toolEligibility(ChatRequest request) {
@@ -310,6 +350,10 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
       builder.responseFormat(ResponseFormatJsonObject.builder().build());
     }
 
+    if ("none".equals(chatRequest.toolChoice())) {
+      builder.toolChoice(ChatCompletionToolChoiceOption.ofAuto(ChatCompletionToolChoiceOption.Auto.NONE));
+    }
+
     for (ChatRequest.Message message : chatRequest.messages()) {
       switch (message.role()) {
         case assistant -> builder.addAssistantMessage(message.content());
@@ -367,7 +411,11 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
     }
 
     if (includeTools) {
-      addToolsToBuilder(builder, chatRequest.clientTools(), serverTools);
+      boolean added = addToolsToBuilder(builder, chatRequest.clientTools(), serverTools);
+
+      if (added && !chatRequest.stream()) {
+        builder.toolChoice(ChatCompletionToolChoiceOption.ofAuto(ChatCompletionToolChoiceOption.Auto.NONE));
+      }
     }
 
     return builder.build();
@@ -377,14 +425,18 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
     return message.imageRefs() != null && !message.imageRefs().isEmpty();
   }
 
-  private void addToolsToBuilder(ChatCompletionCreateParams.Builder builder,
-                                 List<ChatRequest.ClientTool> clientTools,
-                                 RequestToolSet serverTools)
+  // Returns whether any tool definition was added.
+  private boolean addToolsToBuilder(ChatCompletionCreateParams.Builder builder,
+                                    List<ChatRequest.ClientTool> clientTools,
+                                    RequestToolSet serverTools)
   {
+    boolean added = false;
+
     for (Tool tool : serverTools.values()) {
       builder.addTool(ChatCompletionFunctionTool.builder()
                                                 .function(tool.getFunctionDefinition())
                                                 .build());
+      added = true;
     }
 
     if (clientTools != null) {
@@ -406,8 +458,11 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
                                                       .parameters(paramsBuilder.build())
                                                       .build())
                                                   .build());
+        added = true;
       }
     }
+
+    return added;
   }
 
   private ChatCompletionMessageParam buildAssistantMessageWithToolCalls(List<ToolCallRequest> toolCalls) {
@@ -443,8 +498,7 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
       output.write(message.getBytes());
       output.flush();
     } catch (IOException e) {
-      log.warn("Error sending tool call message: {}", e.getMessage());
-      throw new WebApplicationException("Streaming error", Response.Status.INTERNAL_SERVER_ERROR);
+      throw streamingFailure("Error sending tool call message", e);
     }
   }
 
@@ -460,8 +514,7 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
       output.write(message.getBytes());
       output.flush();
     } catch (IOException e) {
-      log.warn("Error sending client tool call message: {}", e.getMessage());
-      throw new WebApplicationException("Streaming error", Response.Status.INTERNAL_SERVER_ERROR);
+      throw streamingFailure("Error sending client tool call message", e);
     }
   }
 
@@ -496,8 +549,7 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
       output.write(message.getBytes());
       output.flush();
     } catch (IOException e) {
-      log.warn("Error sending tool response message: {}", e.getMessage());
-      throw new WebApplicationException("Streaming error", Response.Status.INTERNAL_SERVER_ERROR);
+      throw streamingFailure("Error sending tool response message", e);
     }
   }
 
@@ -517,8 +569,7 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
       output.write(completionMessage.getBytes());
       output.flush();
     } catch (IOException e) {
-      log.warn("Error sending stream completion signal: {}", e.getMessage());
-      throw new WebApplicationException("Streaming error", Response.Status.INTERNAL_SERVER_ERROR);
+      throw streamingFailure("Error sending stream completion signal", e);
     }
   }
 
@@ -586,8 +637,7 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
           streamContentToOutput(content, output);
         }
       } catch (IOException e) {
-        log.error("Error streaming OpenAI response: {}", e.getMessage());
-        throw new WebApplicationException("Streaming error", Response.Status.INTERNAL_SERVER_ERROR);
+        throw streamingFailure("Error streaming OpenAI response", e);
       }
     }
 

@@ -19,6 +19,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -114,17 +115,34 @@ class ExecCommandToolTest {
   }
 
   @Test
-  void rejectsMalformedArgumentsAndInvalidInputShapesBeforeUsingTheWorker() {
+  void treatsOmittedInputsAsNoAttachmentBindings() throws Exception {
+    when(workspace.execute("pwd", List.of(), documents)).thenReturn(
+        new WorkerCommandResult(0, "/var/lib/confer/workspace\n", false));
+
+    for (String arguments : List.of(
+        "{\"cmd\":\"pwd\"}",
+        "{\"cmd\":\"pwd\",\"inputs\":null}")) {
+      ToolResult result = tool.execute(arguments, context);
+
+      assertEquals(0, mapper.readTree(result.modelContent()).path("exit_code").asInt());
+    }
+    verify(workspace, times(2)).execute("pwd", List.of(), documents);
+  }
+
+  @Test
+  void rejectsMalformedArgumentsAndInvalidInputShapesBeforeUsingTheWorker() throws Exception {
     for (String arguments : List.of(
         "not-json",
         "null",
         "{}",
-        "{\"cmd\":\"pwd\"}",
-        "{\"cmd\":\"pwd\",\"inputs\":null}",
+        "{\"cmd\":\" \",\"inputs\":[]}",
+        "{\"cmd\":\"pwd\",\"inputs\":\"report.pdf\"}",
         "{\"cmd\":\"pwd\",\"inputs\":[null]}")) {
       ToolResult result = tool.execute(arguments, context);
+      JsonNode   content = mapper.readTree(result.modelContent());
 
-      assertEquals(ERROR, result.modelContent());
+      assertEquals("Worker execution failed", content.path("error").asText());
+      assertTrue(content.path("details").asText().startsWith("Invalid arguments: "));
       assertEquals(ERROR, result.clientContent());
       assertTrue(result.images().isEmpty());
     }

@@ -7,6 +7,7 @@ import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotEmpty;
 import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.Size;
 import org.moxie.confer.proxy.images.ImageReference;
@@ -30,8 +31,47 @@ public record ChatRequest(
   Boolean thinking,
   Boolean webSearch,
   @Size(max = 128) @Valid List<@NotNull ClientTool> clientTools,
-  @Size(max = 1_000) @Valid List<@NotNull DocumentReference> documents
+  @Size(max = 1_000) @Valid List<@NotNull DocumentReference> documents,
+  @Pattern(regexp = "auto|none") String toolChoice
 ) {
+  public ChatRequest(
+      List<Message> messages,
+      String model,
+      Double temperature,
+      Double topP,
+      Integer topK,
+      Double minP,
+      Double presencePenalty,
+      Double frequencyPenalty,
+      Double repetitionPenalty,
+      Integer maxTokens,
+      Boolean stream,
+      Boolean json,
+      Boolean thinking,
+      Boolean webSearch,
+      List<ClientTool> clientTools,
+      List<DocumentReference> documents)
+  {
+    this(
+        messages,
+        model,
+        temperature,
+        topP,
+        topK,
+        minP,
+        presencePenalty,
+        frequencyPenalty,
+        repetitionPenalty,
+        maxTokens,
+        stream,
+        json,
+        thinking,
+        webSearch,
+        clientTools,
+        documents,
+        null);
+  }
+
   public ChatRequest(
       List<Message> messages,
       String model,

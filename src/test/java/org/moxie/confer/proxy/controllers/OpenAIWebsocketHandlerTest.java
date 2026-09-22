@@ -3,6 +3,10 @@ package org.moxie.confer.proxy.controllers;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.openai.client.OpenAIClient;
+import com.openai.core.http.Headers;
+import com.openai.errors.BadRequestException;
+import com.openai.models.ErrorObject;
+import com.openai.models.chat.completions.ChatCompletionToolChoiceOption;
 import com.openai.core.http.StreamResponse;
 import com.openai.models.chat.completions.ChatCompletion;
 import com.openai.models.chat.completions.ChatCompletionChunk;
@@ -10,6 +14,7 @@ import com.openai.models.chat.completions.ChatCompletionContentPart;
 import com.openai.models.chat.completions.ChatCompletionCreateParams;
 import com.openai.models.chat.completions.ChatCompletionMessage;
 import com.openai.models.chat.completions.ChatCompletionMessageParam;
+import com.openai.models.chat.completions.ChatCompletionToolMessageParam;
 import com.openai.models.chat.completions.ChatCompletionUserMessageParam;
 import com.openai.models.completions.CompletionUsage;
 import com.openai.services.blocking.ChatService;
@@ -1078,7 +1083,7 @@ class OpenAIWebsocketHandlerTest {
 
   @Test
   @SuppressWarnings("unchecked")
-  void handle_streamingWithUnknownTool_logsWarningAndContinues() throws Exception {
+  void handle_streamingWithUnknownTool_tellsTheModelTheToolIsUnavailable() throws Exception {
     ChatRequest chatRequest = new ChatRequest(
         List.of(new ChatRequest.Message(ChatRequest.Role.user, "Do something", null)),
         "gpt-4",
@@ -1146,8 +1151,15 @@ class OpenAIWebsocketHandlerTest {
 
     String output = outputStream.toString();
 
-    // Should still complete, even with unknown tool
+    ArgumentCaptor<ChatCompletionCreateParams> params =
+        ArgumentCaptor.forClass(ChatCompletionCreateParams.class);
+    verify(completionService, times(2)).createStreaming(params.capture());
+    ChatCompletionToolMessageParam toolMessage = params.getAllValues().get(1).messages().getLast().asTool();
+
+    assertEquals("call_unknown", toolMessage.toolCallId());
+    assertTrue(toolMessage.content().asText().contains("not available"));
     assertTrue(output.contains("\"type\":\"tool_call\""));
+    assertTrue(output.contains("\"type\":\"tool_response\""));
     assertTrue(output.contains("\"type\":\"completion\""));
   }
 
@@ -1706,7 +1718,7 @@ class OpenAIWebsocketHandlerTest {
   }
 
   @Test
-  void handle_nonStreamingRequestOmitsServerAndClientTools() throws Exception {
+  void handle_nonStreamingRequestRendersToolsWithToolChoiceNone() throws Exception {
     ChatRequest chatRequest = new ChatRequest(
         List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello", null)),
         "gpt-4",
@@ -1742,14 +1754,61 @@ class OpenAIWebsocketHandlerTest {
 
     Tool tool1 = mock(Tool.class);
     Tool tool2 = mock(Tool.class);
+    when(tool1.getFunctionDefinition()).thenReturn(FunctionDefinition.builder().name("tool1").build());
+    when(tool2.getFunctionDefinition()).thenReturn(FunctionDefinition.builder().name("tool2").build());
     useServerTools(Map.of("tool1", tool1, "tool2", tool2));
 
     handler.handle(requestContext, request);
 
-    verify(completionService).create(argThat((ChatCompletionCreateParams params) ->
-        params.tools().isEmpty() || params.tools().get().isEmpty()
-    ));
-    verifyNoInteractions(toolRegistry);
+    // The same tools a streamed chat would render, so a follow-up shares its
+    // prompt prefix, with tool_choice none since nothing here can run a call.
+    ArgumentCaptor<ChatCompletionCreateParams> captor = ArgumentCaptor.forClass(ChatCompletionCreateParams.class);
+    verify(completionService).create(captor.capture());
+    ChatCompletionCreateParams params = captor.getValue();
+    assertEquals(3, params.tools().orElseThrow().size());
+    assertEquals(ChatCompletionToolChoiceOption.Auto.NONE, params.toolChoice().orElseThrow().asAuto());
+    verify(toolRegistry).forRequest(any(ToolEligibility.class));
+  }
+
+  @Test
+  void handle_nonStreamingRequestWithoutToolsSetsNoToolChoice() throws Exception {
+    ChatRequest chatRequest = new ChatRequest(
+        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello", null)),
+        "gpt-4",
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        false,
+        null,
+        null,
+        false,
+        null
+    );
+    WebsocketRequest request = new WebsocketRequest(1L, "POST", "/v1/chat/completions", Optional.of(mapper.writeValueAsString(chatRequest)));
+
+    ChatCompletion mockCompletion = mock(ChatCompletion.class);
+    ChatCompletion.Choice mockChoice = mock(ChatCompletion.Choice.class);
+    ChatCompletionMessage mockMessage = mock(ChatCompletionMessage.class);
+
+    when(openAIClient.chat()).thenReturn(chatService);
+    when(chatService.completions()).thenReturn(completionService);
+    when(completionService.create(any(ChatCompletionCreateParams.class))).thenReturn(mockCompletion);
+    when(mockCompletion.choices()).thenReturn(List.of(mockChoice));
+    when(mockChoice.message()).thenReturn(mockMessage);
+    when(mockMessage.content()).thenReturn(Optional.of("response"));
+
+    handler.handle(requestContext, request);
+
+    ArgumentCaptor<ChatCompletionCreateParams> captor = ArgumentCaptor.forClass(ChatCompletionCreateParams.class);
+    verify(completionService).create(captor.capture());
+    ChatCompletionCreateParams params = captor.getValue();
+    assertTrue(params.tools().isEmpty() || params.tools().get().isEmpty());
+    assertTrue(params.toolChoice().isEmpty());
   }
 
   @Test
@@ -1919,5 +1978,144 @@ class OpenAIWebsocketHandlerTest {
     when(delta.content()).thenReturn(Optional.of(content));
     when(delta.toolCalls()).thenReturn(Optional.empty());
     return chunk;
+  }
+
+  @Test
+  void handle_toolChoiceNone_passesToolChoiceToClient() throws Exception {
+    ChatRequest chatRequest = new ChatRequest(
+        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Summarize this conversation", null)),
+        "gpt-4",
+        null, null, null, null, null, null, null, null,
+        true,
+        null, null, null, null, null,
+        "none");
+    WebsocketRequest request = new WebsocketRequest(1L, "POST", "/v1/chat/completions", Optional.of(mapper.writeValueAsString(chatRequest)));
+
+    ChatCompletionChunk chunk = mockChunk();
+    ChatCompletionChunk.Choice choice = mock(ChatCompletionChunk.Choice.class);
+    ChatCompletionChunk.Choice.Delta delta = mock(ChatCompletionChunk.Choice.Delta.class);
+    when(chunk.choices()).thenReturn(List.of(choice));
+    when(choice.delta()).thenReturn(delta);
+    when(choice.finishReason()).thenReturn(Optional.of(ChatCompletionChunk.Choice.FinishReason.STOP));
+    when(delta.content()).thenReturn(Optional.of("Summary"));
+    when(delta.toolCalls()).thenReturn(Optional.empty());
+
+    StreamResponse<ChatCompletionChunk> streamResponse = mock(StreamResponse.class);
+    when(streamResponse.stream()).thenReturn(Stream.of(chunk));
+    when(openAIClient.chat()).thenReturn(chatService);
+    when(chatService.completions()).thenReturn(completionService);
+    when(completionService.createStreaming(any(ChatCompletionCreateParams.class))).thenReturn(streamResponse);
+
+    WebsocketHandlerResponse.StreamingResponse response =
+        (WebsocketHandlerResponse.StreamingResponse) handler.handle(requestContext, request);
+    writeStreamingResponse(response, new ByteArrayOutputStream());
+
+    ArgumentCaptor<ChatCompletionCreateParams> captor = ArgumentCaptor.forClass(ChatCompletionCreateParams.class);
+    verify(completionService).createStreaming(captor.capture());
+    ChatCompletionToolChoiceOption toolChoice = captor.getValue().toolChoice().orElseThrow();
+    assertEquals(ChatCompletionToolChoiceOption.Auto.NONE, toolChoice.asAuto());
+  }
+
+  @Test
+  void handle_invalidToolChoice_throwsBadRequest() throws Exception {
+    ChatRequest chatRequest = new ChatRequest(
+        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello", null)),
+        "gpt-4",
+        null, null, null, null, null, null, null, null,
+        true,
+        null, null, null, null, null,
+        "required");
+    WebsocketRequest request = new WebsocketRequest(1L, "POST", "/v1/chat/completions", Optional.of(mapper.writeValueAsString(chatRequest)));
+
+    WebApplicationException exception = assertThrows(WebApplicationException.class, () ->
+        handler.handle(requestContext, request));
+    assertEquals(400, exception.getResponse().getStatus());
+  }
+
+  @Test
+  void handle_contextLengthExceeded_streaming_returns413() throws Exception {
+    ChatRequest chatRequest = new ChatRequest(
+        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello", null)),
+        "gpt-4",
+        null, null, null, null, null, null, null, null,
+        true,
+        null, null, null, null, null);
+    WebsocketRequest request = new WebsocketRequest(1L, "POST", "/v1/chat/completions", Optional.of(mapper.writeValueAsString(chatRequest)));
+
+    when(openAIClient.chat()).thenReturn(chatService);
+    when(chatService.completions()).thenReturn(completionService);
+    when(completionService.createStreaming(any(ChatCompletionCreateParams.class)))
+        .thenThrow(contextLengthExceeded());
+
+    WebsocketHandlerResponse.StreamingResponse response =
+        (WebsocketHandlerResponse.StreamingResponse) handler.handle(requestContext, request);
+    WebApplicationException exception = assertThrows(WebApplicationException.class, () ->
+        writeStreamingResponse(response, new ByteArrayOutputStream()));
+
+    assertEquals(413, exception.getResponse().getStatus());
+  }
+
+  @Test
+  void handle_contextLengthExceeded_nonStreaming_returns413() throws Exception {
+    ChatRequest chatRequest = new ChatRequest(
+        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello", null)),
+        "gpt-4",
+        null, null, null, null, null, null, null, null,
+        false,
+        null, null, null, null, null);
+    WebsocketRequest request = new WebsocketRequest(1L, "POST", "/v1/chat/completions", Optional.of(mapper.writeValueAsString(chatRequest)));
+
+    when(openAIClient.chat()).thenReturn(chatService);
+    when(chatService.completions()).thenReturn(completionService);
+    when(completionService.create(any(ChatCompletionCreateParams.class)))
+        .thenThrow(contextLengthExceeded());
+
+    WebApplicationException exception = assertThrows(WebApplicationException.class, () ->
+        handler.handle(requestContext, request));
+
+    assertEquals(413, exception.getResponse().getStatus());
+  }
+
+  @Test
+  void handle_otherEngineRejection_returns400() throws Exception {
+    ChatRequest chatRequest = new ChatRequest(
+        List.of(new ChatRequest.Message(ChatRequest.Role.user, "Hello", null)),
+        "gpt-4",
+        null, null, null, null, null, null, null, null,
+        true,
+        null, null, null, null, null);
+    WebsocketRequest request = new WebsocketRequest(1L, "POST", "/v1/chat/completions", Optional.of(mapper.writeValueAsString(chatRequest)));
+
+    when(openAIClient.chat()).thenReturn(chatService);
+    when(chatService.completions()).thenReturn(completionService);
+    when(completionService.createStreaming(any(ChatCompletionCreateParams.class)))
+        .thenThrow(BadRequestException.builder()
+            .headers(Headers.builder().build())
+            .error(ErrorObject.builder()
+                .code(Optional.empty())
+                .param(Optional.empty())
+                .type("invalid_request_error")
+                .message("unsupported parameter")
+                .build())
+            .build());
+
+    WebsocketHandlerResponse.StreamingResponse response =
+        (WebsocketHandlerResponse.StreamingResponse) handler.handle(requestContext, request);
+    WebApplicationException exception = assertThrows(WebApplicationException.class, () ->
+        writeStreamingResponse(response, new ByteArrayOutputStream()));
+
+    assertEquals(400, exception.getResponse().getStatus());
+  }
+
+  private static BadRequestException contextLengthExceeded() {
+    return BadRequestException.builder()
+        .headers(Headers.builder().build())
+        .error(ErrorObject.builder()
+            .code(Optional.empty())
+            .param(Optional.empty())
+            .type("invalid_request_error")
+            .message("This model's maximum context length is 262144 tokens. However, you requested 270000 tokens.")
+            .build())
+        .build();
   }
 }

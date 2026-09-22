@@ -203,6 +203,11 @@ public abstract class NoiseConnectionWebsocket {
       }
     } catch (ShortBufferException e) {
       throw new AssertionError(e);
+    } catch (IllegalStateException e) {
+      if (session.isOpen()) {
+        throw e;
+      }
+      throw new ClientDisconnectedException();
     } catch (IOException e) {
       log.warn("Failed to send encrypted message", e);
       phase = Phase.FAILED;
