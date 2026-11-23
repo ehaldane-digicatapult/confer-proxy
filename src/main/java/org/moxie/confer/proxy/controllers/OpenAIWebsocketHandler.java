@@ -1,6 +1,7 @@
 package org.moxie.confer.proxy.controllers;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonMappingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.openai.client.OpenAIClient;
 import com.openai.core.JsonValue;
@@ -22,6 +23,7 @@ import com.openai.models.chat.completions.ChatCompletionMessageToolCall;
 import com.openai.models.completions.CompletionUsage;
 import com.openai.models.chat.completions.ChatCompletionToolMessageParam;
 import com.openai.models.chat.completions.ChatCompletionUserMessageParam;
+import jakarta.validation.ConstraintViolation;
 import jakarta.validation.Validator;
 import jakarta.ws.rs.WebApplicationException;
 import jakarta.ws.rs.core.Response;
@@ -108,7 +110,7 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
     } else {
       return new WebsocketHandlerResponse.SingleResponse(
           200,
-          handleNonStreamingRequest(model, chatRequest));
+          handleNonStreamingRequest(model, chatRequest, context.getImagePool()));
     }
   }
 
@@ -117,26 +119,53 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
       throw new WebApplicationException("Request body is required", 400);
     }
 
+    ChatRequest chatRequest;
+
     try {
-      ChatRequest chatRequest = mapper.readValue(request.body().get(), ChatRequest.class);
-
-      if (chatRequest == null || !validator.validate(chatRequest).isEmpty()) {
-        throw new WebApplicationException("Invalid ChatRequest body", 400);
-      }
-
-      return chatRequest;
+      chatRequest = mapper.readValue(request.body().get(), ChatRequest.class);
+    } catch (JsonMappingException error) {
+      log.warn("Unreadable ChatRequest field: {}", error.getPathReference());
+      throw new WebApplicationException("Invalid ChatRequest body", 400);
     } catch (JsonProcessingException error) {
+      log.warn("Malformed ChatRequest JSON");
       throw new WebApplicationException("Invalid ChatRequest body", 400);
     }
+
+    if (chatRequest == null) {
+      log.warn("Empty ChatRequest body");
+      throw new WebApplicationException("Invalid ChatRequest body", 400);
+    }
+
+    Set<ConstraintViolation<ChatRequest>> violations = validator.validate(chatRequest);
+
+    if (!violations.isEmpty()) {
+      log.warn("ChatRequest failed validation: {}", describeViolations(violations));
+      throw new WebApplicationException("Invalid ChatRequest body", 400);
+    }
+
+    return chatRequest;
+  }
+
+  // Field paths and constraint names only (e.g. "clientTools[3].parameters NotNull"),
+  // never the rejected values, which can carry message content.
+  private static String describeViolations(Set<ConstraintViolation<ChatRequest>> violations) {
+    return violations.stream()
+                     .map(violation -> violation.getPropertyPath() + " " +
+                                       violation.getConstraintDescriptor().getAnnotation().annotationType().getSimpleName())
+                     .sorted()
+                     .collect(Collectors.joining(", "));
   }
 
   // No tool loop runs on this path, but the request's tool definitions still
   // belong in the prompt: a follow-up on a streamed chat (its title, its memory
   // extraction) shares that chat's prompt prefix only if the template renders
   // the same tools. tool_choice "none" keeps the model from calling any.
-  private String handleNonStreamingRequest(ChatModel model, ChatRequest chatRequest) {
+  private String handleNonStreamingRequest(ChatModel   model,
+                                           ChatRequest chatRequest,
+                                           String      imagePool)
+  {
     RequestToolSet serverTools = toolRegistry.forRequest(toolEligibility(chatRequest));
-    ChatCompletionCreateParams params = buildCompletionParams(model, chatRequest, new ArrayList<>(), true, serverTools);
+    ChatCompletionCreateParams params = buildCompletionParams(model, chatRequest, new ArrayList<>(), true, serverTools, imagePool);
     try {
       return client.chat().completions().create(params).choices().getFirst().message().content().orElse("");
     } catch (BadRequestException error) {
@@ -163,8 +192,10 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
                                        OutputStream               output)
   {
     try {
-      DocumentToolSession documentSession = documentToolSessions.open(chatRequest.documents());
       WorkerWorkspace     workerWorkspace = context.getWorkerWorkspace(workerClient);
+      DocumentToolSession documentSession = documentToolSessions.open(
+          chatRequest.documents(),
+          workerWorkspace.getDocumentWorkers());
 
       List<ChatCompletionMessageParam> conversationHistory = new ArrayList<>();
       int                              maxIterations       = config.getMaxToolIterations();
@@ -190,7 +221,7 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
           conversationHistory.add(ChatCompletionMessageParam.ofUser(wrapUpMessage));
         }
 
-        ChatCompletionCreateParams params    = buildCompletionParams(model, chatRequest, conversationHistory, !isLastIteration, serverTools);
+        ChatCompletionCreateParams params    = buildCompletionParams(model, chatRequest, conversationHistory, !isLastIteration, serverTools, context.getImagePool());
         ChunkProcessor             processor = new ChunkProcessor();
 
         try (StreamResponse<ChatCompletionChunk> response = client.chat().completions().createStreaming(params)) {
@@ -224,7 +255,8 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
               ToolResult             result       = executed.result();
               ToolResultPresentation presentation = messagePresenter.presentToolResult(
                   request.id(),
-                  result);
+                  result,
+                  context.getImagePool());
               conversationHistory.addAll(presentation.messages());
 
               sendToolResponseToClient(request.id(),
@@ -299,7 +331,8 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
                                                            ChatRequest chatRequest,
                                                            List<ChatCompletionMessageParam> additionalMessages,
                                                            boolean includeTools,
-                                                           RequestToolSet serverTools)
+                                                           RequestToolSet serverTools,
+                                                           String imagePool)
   {
     ChatCompletionCreateParams.Builder builder = ChatCompletionCreateParams.builder()
                                                                            .model(model);
@@ -359,7 +392,7 @@ public class OpenAIWebsocketHandler implements WebsocketHandler {
         case assistant -> builder.addAssistantMessage(message.content());
         case user      -> {
           if (hasImages(message)) {
-            builder.addMessage(ChatCompletionMessageParam.ofUser(messagePresenter.presentUserMessage(message.content(), message.imageRefs())));
+            builder.addMessage(ChatCompletionMessageParam.ofUser(messagePresenter.presentUserMessage(message.content(), message.imageRefs(), imagePool)));
           } else {
             builder.addUserMessage(message.content());
           }

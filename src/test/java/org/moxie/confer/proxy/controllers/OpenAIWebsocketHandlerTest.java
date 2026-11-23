@@ -33,6 +33,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.moxie.confer.proxy.attachments.AttachmentReference;
 import org.moxie.confer.proxy.websocket.WebsocketConnectionContext;
 import org.moxie.confer.proxy.crypto.ImageToken;
+import org.moxie.confer.proxy.images.ImagePoolKey;
 import org.moxie.confer.proxy.documents.DocumentToolSession;
 import org.moxie.confer.proxy.documents.DocumentToolSessionFactory;
 import org.moxie.confer.proxy.documents.InvalidDocumentManifestException;
@@ -78,6 +79,8 @@ import static org.mockito.Mockito.lenient;
 
 @ExtendWith(MockitoExtension.class)
 class OpenAIWebsocketHandlerTest {
+
+  private static final String IMAGE_POOL = ImagePoolKey.generate();
 
   private static ValidatorFactory validatorFactory;
 
@@ -161,7 +164,8 @@ class OpenAIWebsocketHandlerTest {
     lenient().when(config.getVllmServedModelName()).thenReturn("test-model");
     lenient().when(toolRegistry.forRequest(any(ToolEligibility.class)))
         .thenReturn(requestTools);
-    lenient().when(documentToolSessions.open(any())).thenReturn(emptyDocumentSession);
+    lenient().when(documentToolSessions.open(any(), any())).thenReturn(emptyDocumentSession);
+    lenient().when(requestContext.getImagePool()).thenReturn(IMAGE_POOL);
     lenient().when(requestContext.getWorkerWorkspace(any()))
         .thenReturn(workerWorkspace);
     useServerTools(Map.of());
@@ -215,7 +219,7 @@ class OpenAIWebsocketHandlerTest {
         "POST",
         "/v1/chat/completions",
         Optional.of(mapper.writeValueAsString(chatRequest)));
-    when(documentToolSessions.open(List.of(reference)))
+    when(documentToolSessions.open(eq(List.of(reference)), any()))
         .thenThrow(new InvalidDocumentManifestException("Document reference is invalid"));
 
     WebsocketHandlerResponse.StreamingResponse response =
@@ -360,11 +364,12 @@ class OpenAIWebsocketHandlerTest {
         "URL should contain encoded opaque S3 key");
     assertTrue(url.contains("ek="), "URL should contain encryption key param");
     assertTrue(url.contains("token="), "URL should contain token param");
-    assertTrue(url.contains("type=image%2Fjpeg"), "URL should contain media type param");
+    assertFalse(url.contains("type="), "The endpoint serves every image as a PPM, so no media type is passed");
+    assertTrue(url.endsWith("&pool=" + IMAGE_POOL), "URL should name the requesting connection's normalizer pool");
     String generatedImageUrl = parts.get(2).asImageUrl().imageUrl().url();
     assertTrue(generatedImageUrl.contains("key=temporary-images%2Fcrop"));
-    assertTrue(generatedImageUrl.contains("type=image%2Fpng"));
     assertTrue(generatedImageUrl.contains("token="));
+    assertTrue(generatedImageUrl.endsWith("&pool=" + IMAGE_POOL), "Tool images belong to the same connection's pool");
   }
 
   @Test
@@ -1884,7 +1889,7 @@ class OpenAIWebsocketHandlerTest {
     ChatCompletionChunk.Choice.Delta delta = mock(ChatCompletionChunk.Choice.Delta.class);
     StreamResponse<ChatCompletionChunk> streamResponse = mock(StreamResponse.class);
 
-    when(documentToolSessions.open(List.of(reference))).thenReturn(documentSession);
+    when(documentToolSessions.open(eq(List.of(reference)), any())).thenReturn(documentSession);
     when(fileSearch.getFunctionDefinition()).thenReturn(function);
     useServerTools(Map.of("file_search", fileSearch));
     when(openAIClient.chat()).thenReturn(chatService);
